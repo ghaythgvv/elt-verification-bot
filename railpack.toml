@@ -1,0 +1,3 @@
+[deploy]
+cmd = "python verification_bot.py"
+
