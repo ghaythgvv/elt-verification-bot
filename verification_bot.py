@@ -12,7 +12,11 @@ How it works:
    - Each waiting-for-help channel has its own emoji shown in the alert title, and can
      independently turn the member-facing "Describe Issue" report form on or off
      (see HELP_VC_CONFIG below).
-3) When anyone clicks Verify:
+3) When a member joins one of the "REPORT" voice channels:
+   - No message is sent anywhere. Instead the bot just prefixes the channel's own name
+     with an alert emoji (⛔) while someone is waiting in it, and removes the emoji again
+     once the channel is empty (see REPORT_VC_IDS below).
+4) When anyone clicks Verify:
    - The "Verified" role and "Member" role (or any other roles you set) get added.
    - If the member already has the "Unverified" role, it gets removed.
    - An optional welcome message is sent in the welcome channel (if you set one up).
@@ -46,16 +50,25 @@ WAITING_VC_ID = 1513904254535073883              # the "Waiting for Move" voice 
 HELP_ALERT_CHANNEL_ID = 1551163762084683866  # channel where the staff alert gets posted (the Waiting for Help voice channel's own chat)
 MEMBER_HELP_PANEL_CHANNEL_ID = 1517941411151085691  # channel where the member-facing panel gets posted
 
-# Per-VC settings for the "waiting for help" flow:
+# Per-VC settings for the "waiting for help" flow (staff alert + optional member panel):
 #   - emoji: shown in the staff alert embed title, so you can tell at a glance which
 #     channel triggered it
 #   - send_member_panel: whether the member-facing "Describe Issue" report form panel
 #     gets sent for this channel (False = staff alert only, no report form)
-HELP_VC_CONFIG = {
-    1551163762084683866: {"emoji": "🆘", "send_member_panel": True},
-    1517941411151085691: {"emoji": "🆘", "send_member_panel": True},
-    1552746347113746453: {"emoji": "🚫", "send_member_panel": False},  # report form off
-    1552746364775956620: {"emoji": "🚫", "send_member_panel": False},  # report form off
+# Currently empty - none of the "REPORT" voice channels use this flow anymore, they use
+# the silent emoji-in-name flow below instead (REPORT_VC_IDS). Add a VC ID here only if
+# you want the old "post an alert + optional report form" behavior for it.
+HELP_VC_CONFIG = {}
+
+# The "REPORT" voice channels: no message is ever sent for these. Instead, while at least
+# one member is waiting in one of these channels, the bot prefixes that channel's own name
+# with REPORT_VC_EMOJI. As soon as the channel is empty again, the emoji is removed.
+REPORT_VC_EMOJI = "⛔"
+REPORT_VC_IDS = {
+    1551163762084683866,
+    1517941411151085691,
+    1552746347113746453,
+    1552746364775956620,
 }
 
 # Roles
@@ -78,6 +91,10 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 invite_cache = {}
 member_inviters = {}  # {member_id: inviter_user_object}
 member_help_panels = {}  # {member_id: discord.Message} - the member-facing help panel, so it can be deleted later
+
+# report_vc_base_names[channel_id] = the channel's name with REPORT_VC_EMOJI stripped off,
+# so we can restore it exactly once the channel empties out again.
+report_vc_base_names = {}
 
 
 async def cache_invites(guild: discord.Guild):
@@ -112,6 +129,39 @@ async def send_with_retry(channel, **kwargs):
                     raise
             else:
                 raise
+
+
+def get_report_vc_base_name(channel: discord.VoiceChannel) -> str:
+    """Returns channel.name with the REPORT_VC_EMOJI prefix stripped off (if present),
+    caching the result so later calls always restore the true original name even after
+    we've renamed the channel."""
+    if channel.id not in report_vc_base_names:
+        name = channel.name
+        prefix = f"{REPORT_VC_EMOJI} "
+        if name.startswith(prefix):
+            name = name[len(prefix):]
+        report_vc_base_names[channel.id] = name
+    return report_vc_base_names[channel.id]
+
+
+async def set_report_vc_alert(channel: discord.VoiceChannel, active: bool):
+    """Prefixes/un-prefixes a REPORT voice channel's name with REPORT_VC_EMOJI. Never sends
+    any message - the renamed channel itself is the alert."""
+    base_name = get_report_vc_base_name(channel)
+    target_name = f"{REPORT_VC_EMOJI} {base_name}" if active else base_name
+
+    if channel.name == target_name:
+        return  # already in the right state
+
+    try:
+        await channel.edit(name=target_name, reason="Report VC occupancy changed")
+        print(f"✏️ Report VC {channel.id} renamed -> {target_name!r}")
+    except discord.Forbidden:
+        print(f"⚠️ Bot doesn't have permission to rename channel {channel.id}")
+    except discord.HTTPException as e:
+        # Discord limits channel name changes to ~2 per 10 minutes per channel, so rapid
+        # join/leave churn can hit this - it'll just catch up on the next state change.
+        print(f"⚠️ Failed to rename channel {channel.id}: {e}")
 
 
 class VerifyView(discord.ui.View):
@@ -270,10 +320,15 @@ class MemberHelpPanelView(discord.ui.View):
 @bot.event
 async def on_ready():
     print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
-    # Cache invites for the guild when bot starts
     guild = bot.get_guild(GUILD_ID)
     if guild:
         await cache_invites(guild)
+        # Sync REPORT VC name state in case people were already waiting when the bot
+        # started (or it crashed mid-rename last time).
+        for vc_id in REPORT_VC_IDS:
+            channel = guild.get_channel(vc_id)
+            if channel is not None:
+                await set_report_vc_alert(channel, len(channel.members) > 0)
     else:
         print(f"❌ Guild {GUILD_ID} not found!")
 
@@ -490,20 +545,31 @@ async def delete_member_help_panel(member_id: int):
 
 @bot.event
 async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
-    """Routes to the verification alert or the help alert depending on which waiting channel was joined."""
+    """Routes to the verification alert, the help alert, or the silent REPORT-VC emoji
+    toggle depending on which waiting channel was joined/left."""
     if member.guild.id != GUILD_ID:
         return
 
     joined_id = after.channel.id if after.channel else None
     came_from_id = before.channel.id if before.channel else None
 
-    if joined_id == WAITING_VC_ID and came_from_id != WAITING_VC_ID:
+    if joined_id == came_from_id:
+        return  # no actual channel change (e.g. mute/deafen toggle)
+
+    if joined_id == WAITING_VC_ID:
         await send_verification_alert(member, after.channel)
-    elif joined_id in HELP_VC_CONFIG and came_from_id not in HELP_VC_CONFIG:
+    elif joined_id in HELP_VC_CONFIG:
         await send_help_alert(member, after.channel, HELP_VC_CONFIG[joined_id])
-    elif came_from_id in HELP_VC_CONFIG and joined_id not in HELP_VC_CONFIG:
+    elif joined_id in REPORT_VC_IDS:
+        await set_report_vc_alert(after.channel, True)
+
+    if came_from_id in HELP_VC_CONFIG:
         # Member left a Waiting for Help VC (got moved, or left on their own) — clean up their panel
         await delete_member_help_panel(member.id)
+    elif came_from_id in REPORT_VC_IDS:
+        # Only clear the emoji once nobody is left waiting in that channel
+        if len(before.channel.members) == 0:
+            await set_report_vc_alert(before.channel, False)
 
 
 if not TOKEN:
