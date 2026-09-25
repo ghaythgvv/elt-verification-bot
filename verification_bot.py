@@ -65,8 +65,6 @@ HELP_VC_CONFIG = {}
 # REPORT_VC_EMOJI. As soon as they leave the channel, their nickname is restored.
 REPORT_VC_EMOJI = "⛔"
 REPORT_VC_IDS = {
-    1551163762084683866,
-    1517941411151085691,
     1552746347113746453,
     1552746364775956620,
 }
@@ -331,9 +329,11 @@ async def on_ready():
         # started (or it crashed mid-rename last time).
         for vc_id in REPORT_VC_IDS:
             channel = guild.get_channel(vc_id)
-            if channel is not None:
+            if isinstance(channel, (discord.VoiceChannel, discord.StageChannel)):
                 for waiting_member in channel.members:
                     await set_report_vc_alert(waiting_member, True)
+            elif channel is not None:
+                print(f"⚠️ REPORT_VC_IDS has {vc_id}, but that's a {type(channel).__name__}, not a voice channel — skipping it")
     else:
         print(f"❌ Guild {GUILD_ID} not found!")
 
@@ -565,13 +565,13 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
         await send_verification_alert(member, after.channel)
     elif joined_id in HELP_VC_CONFIG:
         await send_help_alert(member, after.channel, HELP_VC_CONFIG[joined_id])
-    elif joined_id in REPORT_VC_IDS:
+    elif joined_id in REPORT_VC_IDS and isinstance(after.channel, (discord.VoiceChannel, discord.StageChannel)):
         await set_report_vc_alert(member, True)
 
     if came_from_id in HELP_VC_CONFIG:
         # Member left a Waiting for Help VC (got moved, or left on their own) — clean up their panel
         await delete_member_help_panel(member.id)
-    elif came_from_id in REPORT_VC_IDS:
+    elif came_from_id in REPORT_VC_IDS and isinstance(before.channel, (discord.VoiceChannel, discord.StageChannel)):
         await set_report_vc_alert(member, False)
 
 
