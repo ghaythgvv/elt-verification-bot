@@ -13,56 +13,56 @@ How it works:
    - The "Verified" role and "Member" role (or any other roles you set) get added.
    - If the member already has the "Unverified" role, it gets removed.
    - An optional welcome message is sent in the welcome channel (if you set one up).
- 
+
 Requirements:
     pip install discord.py
- 
+
 Before running:
     - Enable SERVER MEMBERS INTENT for your bot in the Discord Developer Portal.
     - Put your token in place of "PUT_YOUR_BOT_TOKEN_HERE" below (from Developer Portal > your bot > Bot > Token).
 """
- 
+
 import os
 import asyncio
- 
+
 import discord
 from discord.ext import commands
- 
+
 # =========================== CONFIG ===========================
 # The token is read from an environment variable instead of being written here,
 # so it's safe to upload this file. Set DISCORD_TOKEN in Railway's "Variables" tab.
 TOKEN = os.environ.get("DISCORD_TOKEN")
- 
+
 GUILD_ID = 1410440666747633707  # ELT server ID
- 
+
 # Channels
 VERIFICATION_CHANNEL_ID = 1542531178526146670  # channel where verify requests get posted
 WELCOME_CHANNEL_ID = None                        # welcome channel (optional - leave as None if you don't want a welcome message)
 WAITING_VC_ID = 1513904254535073883              # the "Waiting for Move" voice channel
- 
+
 WAITING_FOR_HELP_VC_IDS = {1551163762084683866, 1517941411151085691}  # any of these voice channels trigger the help alert
 HELP_ALERT_CHANNEL_ID = 1551163762084683866  # channel where help alerts get posted (the Waiting for Help voice channel's own chat)
- 
+
 # Roles
 UNVERIFIED_ROLE_ID = 1513904174079934657  # removed from the member at verify time if they have it (not given automatically anymore)
 VERIFIED_ROLE_ID = 1513904156350353511    # given after verification
- 
+
 EXTRA_ROLES_ON_VERIFY = [1513904151309058159]  # MEMBER role - given alongside Verified
 # ================================================================
- 
+
 intents = discord.Intents.default()
 intents.members = True
 intents.voice_states = True  # needed to detect members joining the voice channel
 intents.message_content = True  # ensure message content intent is enabled
 intents.invites = True  # needed to track invites
- 
+
 bot = commands.Bot(command_prefix="!", intents=intents)
- 
+
 # Invite tracking
 invite_cache = {}  # {guild_id: {invite_code: use_count}}
 member_inviters = {}  # {member_id: inviter_user_object}
- 
- 
+
+
 async def cache_invites(guild: discord.Guild):
     """Cache all invites for a guild and their use counts."""
     try:
@@ -71,13 +71,13 @@ async def cache_invites(guild: discord.Guild):
         print(f"✅ Cached {len(invites)} invites for guild {guild.id}")
     except discord.Forbidden:
         print(f"⚠️ Bot doesn't have permission to view invites in guild {guild.id}")
- 
- 
+
+
 async def send_with_retry(channel, **kwargs):
     """Send a message with exponential backoff retry logic for rate limits."""
     max_attempts = 5
     backoff_delays = [1, 2, 4, 8, 16]  # seconds
- 
+
     for attempt in range(max_attempts):
         try:
             return await channel.send(**kwargs)
@@ -92,30 +92,30 @@ async def send_with_retry(channel, **kwargs):
                     raise
             else:
                 raise
- 
- 
+
+
 class VerifyView(discord.ui.View):
     """Verify/Reject buttons. timeout=None so they keep working even after a bot restart."""
- 
+
     def __init__(self, member_id: int):
         super().__init__(timeout=None)
         self.member_id = member_id
         self.children[0].custom_id = f"verify_accept_{member_id}"
         self.children[1].custom_id = f"verify_reject_{member_id}"
- 
+
     @discord.ui.button(label="✅ Verify", style=discord.ButtonStyle.success)
     async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
         # Defer first to prevent timeout
         await interaction.response.defer()
- 
+
         guild = interaction.guild
         member = guild.get_member(self.member_id)
         if member is None:
             return await interaction.followup.send("That member isn't in the server anymore (they may have left).", ephemeral=True)
- 
+
         unverified_role = guild.get_role(UNVERIFIED_ROLE_ID)
         verified_role = guild.get_role(VERIFIED_ROLE_ID)
- 
+
         try:
             if unverified_role and unverified_role in member.roles:
                 await member.remove_roles(unverified_role, reason=f"Verified by {interaction.user}")
@@ -130,35 +130,35 @@ class VerifyView(discord.ui.View):
                 "The bot doesn't have enough permission to change roles (make sure the bot's role is above the roles it manages).",
                 ephemeral=True,
             )
- 
+
         embed = interaction.message.embeds[0]
         embed.color = discord.Color.green()
-        embed.set_footer(text=f"Verified ✅ by {interaction.user}")
+        embed.set_footer(text=f"Verified ✅ by {interaction.user.display_name}")
         for item in self.children:
             item.disabled = True
         await interaction.followup.edit_message(interaction.message.id, embed=embed, view=self)
- 
+
         if WELCOME_CHANNEL_ID:
             welcome_channel = guild.get_channel(WELCOME_CHANNEL_ID)
             if welcome_channel:
                 await welcome_channel.send(f"🎉 Welcome {member.mention}, you're verified — glad to have you in the server!")
- 
+
     @discord.ui.button(label="❌ Reject", style=discord.ButtonStyle.danger)
     async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
         # Defer first to prevent timeout
         await interaction.response.defer()
- 
+
         embed = interaction.message.embeds[0]
         embed.color = discord.Color.red()
-        embed.set_footer(text=f"Rejected ❌ by {interaction.user}")
+        embed.set_footer(text=f"Rejected ❌ by {interaction.user.display_name}")
         for item in self.children:
             item.disabled = True
         await interaction.followup.edit_message(interaction.message.id, embed=embed, view=self)
- 
- 
+
+
 class ResolveNoteModal(discord.ui.Modal, title="Resolve Help Request"):
     """Popup asking what the problem was, shown when staff click Mark as Resolved."""
- 
+
     note = discord.ui.TextInput(
         label="What was the problem? (optional)",
         style=discord.TextStyle.paragraph,
@@ -166,35 +166,35 @@ class ResolveNoteModal(discord.ui.Modal, title="Resolve Help Request"):
         required=False,
         max_length=500,
     )
- 
+
     def __init__(self, view: "HelpRequestView"):
         super().__init__()
         self.view = view
- 
+
     async def on_submit(self, interaction: discord.Interaction):
         embed = interaction.message.embeds[0]
         embed.color = discord.Color.green()
         if self.note.value:
             embed.add_field(name="What happened", value=self.note.value, inline=False)
-        embed.set_footer(text=f"Resolved ✅ by {interaction.user}")
+        embed.set_footer(text=f"Resolved ✅ by {interaction.user.display_name}")
         for item in self.view.children:
             item.disabled = True
         await interaction.response.edit_message(embed=embed, view=self.view)
- 
- 
+
+
 class HelpRequestView(discord.ui.View):
     """Single 'Mark as Resolved' button for help alerts. Opens a popup asking what the problem was. Doesn't touch any roles."""
- 
+
     def __init__(self, member_id: int):
         super().__init__(timeout=None)
         self.member_id = member_id
         self.children[0].custom_id = f"help_resolved_{member_id}"
- 
+
     @discord.ui.button(label="✅ Mark as Resolved", style=discord.ButtonStyle.success)
     async def resolve(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(ResolveNoteModal(self))
- 
- 
+
+
 @bot.event
 async def on_ready():
     print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
@@ -204,39 +204,39 @@ async def on_ready():
         await cache_invites(guild)
     else:
         print(f"❌ Guild {GUILD_ID} not found!")
- 
- 
+
+
 @bot.event
 async def on_invite_create(invite: discord.Invite):
     """Refresh invite cache when a new invite is created."""
     if invite.guild.id == GUILD_ID:
         await cache_invites(invite.guild)
         print(f"📝 Invite created: {invite.code}")
- 
- 
+
+
 @bot.event
 async def on_invite_delete(invite: discord.Invite):
     """Refresh invite cache when an invite is deleted."""
     if invite.guild.id == GUILD_ID:
         await cache_invites(invite.guild)
         print(f"🗑️ Invite deleted: {invite.code}")
- 
- 
+
+
 @bot.event
 async def on_member_join(member: discord.Member):
     """Track who invited the member by comparing invite use counts."""
     if member.guild.id != GUILD_ID:
         return
- 
+
     print(f"➕ {member} joined the server")
- 
+
     # Give bot a second to see the updated invites
     await asyncio.sleep(1)
- 
+
     try:
         current_invites = await member.guild.invites()
         old_cache = invite_cache.get(member.guild.id, {})
- 
+
         inviter = None
         for invite in current_invites:
             old_uses = old_cache.get(invite.code, 0)
@@ -245,38 +245,38 @@ async def on_member_join(member: discord.Member):
                 inviter = invite.inviter
                 print(f"👤 {member} was invited by {inviter}")
                 break
- 
+
         if inviter:
             member_inviters[member.id] = inviter
         else:
             # Could be vanity URL or invite info not available
             print(f"❓ {member} joined via unknown invite (possibly vanity URL)")
             member_inviters[member.id] = None
- 
+
         # Update cache
         await cache_invites(member.guild)
     except discord.Forbidden:
         print(f"⚠️ Bot doesn't have permission to view invites")
- 
- 
+
+
 async def send_verification_alert(member: discord.Member, voice_channel: discord.VoiceChannel):
     """Posts the 'awaiting verification' embed with Verify/Reject buttons."""
     # Skip if already verified
     verified_role = member.guild.get_role(VERIFIED_ROLE_ID)
     if verified_role and verified_role in member.roles:
         return
- 
+
     verification_channel = member.guild.get_channel(VERIFICATION_CHANNEL_ID)
     if verification_channel is None:
         print("⚠️ Couldn't find the verification channel — check VERIFICATION_CHANNEL_ID")
         return
- 
+
     print(f"📤 Sending verification message for {member}")
- 
+
     # Build description with invite info if available
     inviter = member_inviters.get(member.id)
     invited_by_text = f"Invited by: {inviter.mention}" if inviter else "Invited by: Unknown (vanity URL or unknown invite)"
- 
+
     embed = discord.Embed(
         title="Member awaiting verification",
         description=(
@@ -291,9 +291,9 @@ async def send_verification_alert(member: discord.Member, voice_channel: discord
     )
     embed.set_thumbnail(url=member.display_avatar.url)
     embed.set_footer(text="Click Verify to let this member in")
- 
+
     view = VerifyView(member.id)
- 
+
     try:
         await send_with_retry(
             verification_channel,
@@ -305,17 +305,17 @@ async def send_verification_alert(member: discord.Member, voice_channel: discord
         print(f"✅ Verification message sent for {member}")
     except Exception as e:
         print(f"❌ Failed to send verification message: {e}")
- 
- 
+
+
 async def send_help_alert(member: discord.Member, voice_channel: discord.VoiceChannel):
     """Posts a 'needs help' embed - no invited-by/joined-server info, no role changes, just an alert + resolve button."""
     help_channel = member.guild.get_channel(HELP_ALERT_CHANNEL_ID)
     if help_channel is None:
         print("⚠️ Couldn't find the help alert channel — check HELP_ALERT_CHANNEL_ID")
         return
- 
+
     print(f"📤 Sending help alert for {member}")
- 
+
     embed = discord.Embed(
         title="Member needs help",
         description=(
@@ -328,9 +328,9 @@ async def send_help_alert(member: discord.Member, voice_channel: discord.VoiceCh
     )
     embed.set_thumbnail(url=member.display_avatar.url)
     embed.set_footer(text="Click Mark as Resolved once this is handled")
- 
+
     view = HelpRequestView(member.id)
- 
+
     try:
         await send_with_retry(
             help_channel,
@@ -342,25 +342,24 @@ async def send_help_alert(member: discord.Member, voice_channel: discord.VoiceCh
         print(f"✅ Help alert sent for {member}")
     except Exception as e:
         print(f"❌ Failed to send help alert: {e}")
- 
- 
+
+
 @bot.event
 async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
     """Routes to the verification alert or the help alert depending on which waiting channel was joined."""
     if member.guild.id != GUILD_ID:
         return
- 
+
     joined_id = after.channel.id if after.channel else None
     came_from_id = before.channel.id if before.channel else None
- 
+
     if joined_id == WAITING_VC_ID and came_from_id != WAITING_VC_ID:
         await send_verification_alert(member, after.channel)
     elif joined_id in WAITING_FOR_HELP_VC_IDS and came_from_id not in WAITING_FOR_HELP_VC_IDS:
         await send_help_alert(member, after.channel)
- 
- 
+
+
 if not TOKEN:
     raise SystemExit("DISCORD_TOKEN is not set. Add it in Railway's Variables tab, then redeploy.")
- 
+
 bot.run(TOKEN)
- 
