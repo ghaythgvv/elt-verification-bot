@@ -489,8 +489,3 @@ if not TOKEN:
     raise SystemExit("DISCORD_TOKEN is not set. Add it in Railway's Variables tab, then redeploy.")
 
 bot.run(TOKEN)
-PYEOF
-python3 -m py_compile /mnt/user-data/outputs/verification_bot.py && echo "SYNTAX OK"
-Output
-
-SYNTAX OK
