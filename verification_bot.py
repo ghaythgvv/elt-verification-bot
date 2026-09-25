@@ -59,15 +59,19 @@ intents.invites = True  # needed to track invites
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # Invite tracking
-invite_cache = {}  # {guild_id: {invite_code: use_count}}
+# invite_cache[guild_id][code] = {"uses": int, "max_uses": int, "inviter": discord.User}
+invite_cache = {}
 member_inviters = {}  # {member_id: inviter_user_object}
 
 
 async def cache_invites(guild: discord.Guild):
-    """Cache all invites for a guild and their use counts."""
+    """Cache all invites for a guild - their use counts, use limits, and inviters."""
     try:
         invites = await guild.invites()
-        invite_cache[guild.id] = {invite.code: invite.uses for invite in invites}
+        invite_cache[guild.id] = {
+            invite.code: {"uses": invite.uses, "max_uses": invite.max_uses, "inviter": invite.inviter}
+            for invite in invites
+        }
         print(f"✅ Cached {len(invites)} invites for guild {guild.id}")
     except discord.Forbidden:
         print(f"⚠️ Bot doesn't have permission to view invites in guild {guild.id}")
@@ -133,7 +137,8 @@ class VerifyView(discord.ui.View):
 
         embed = interaction.message.embeds[0]
         embed.color = discord.Color.green()
-        embed.set_footer(text=f"Verified ✅ by {interaction.user.display_name}")
+        embed.add_field(name="Verified", value=f"✅ {interaction.user.mention}", inline=False)
+        embed.set_footer(text="Verified ✅")
         for item in self.children:
             item.disabled = True
         await interaction.followup.edit_message(interaction.message.id, embed=embed, view=self)
@@ -150,7 +155,8 @@ class VerifyView(discord.ui.View):
 
         embed = interaction.message.embeds[0]
         embed.color = discord.Color.red()
-        embed.set_footer(text=f"Rejected ❌ by {interaction.user.display_name}")
+        embed.add_field(name="Rejected", value=f"❌ {interaction.user.mention}", inline=False)
+        embed.set_footer(text="Rejected ❌")
         for item in self.children:
             item.disabled = True
         await interaction.followup.edit_message(interaction.message.id, embed=embed, view=self)
@@ -176,7 +182,8 @@ class ResolveNoteModal(discord.ui.Modal, title="Resolve Help Request"):
         embed.color = discord.Color.green()
         if self.note.value:
             embed.add_field(name="What happened", value=self.note.value, inline=False)
-        embed.set_footer(text=f"Resolved ✅ by {interaction.user.display_name}")
+        embed.add_field(name="Resolved", value=f"✅ {interaction.user.mention}", inline=False)
+        embed.set_footer(text="Resolved ✅")
         for item in self.view.children:
             item.disabled = True
         await interaction.response.edit_message(embed=embed, view=self.view)
@@ -224,7 +231,8 @@ async def on_invite_delete(invite: discord.Invite):
 
 @bot.event
 async def on_member_join(member: discord.Member):
-    """Track who invited the member by comparing invite use counts."""
+    """Track who invited the member by comparing invite use counts (and catching single-use
+    invites, which Discord deletes the instant they're used, before this even runs)."""
     if member.guild.id != GUILD_ID:
         return
 
@@ -235,16 +243,32 @@ async def on_member_join(member: discord.Member):
 
     try:
         current_invites = await member.guild.invites()
+        current_by_code = {invite.code: invite for invite in current_invites}
         old_cache = invite_cache.get(member.guild.id, {})
 
         inviter = None
+
+        # Case 1: an invite that still exists went up in use count
         for invite in current_invites:
-            old_uses = old_cache.get(invite.code, 0)
+            old_uses = old_cache.get(invite.code, {}).get("uses", 0)
             if invite.uses > old_uses:
-                # This invite was used
                 inviter = invite.inviter
-                print(f"👤 {member} was invited by {inviter}")
+                print(f"👤 {member} was invited by {inviter} (invite {invite.code})")
                 break
+
+        # Case 2: a limited-use invite (e.g. a single-use link) got used up and Discord
+        # deleted it, so it's no longer in current_invites to compare against at all.
+        # If an invite we knew about is now gone, and it was exactly one use away from
+        # its limit, that almost certainly means this join is what used it up.
+        if inviter is None:
+            for code, old_invite in old_cache.items():
+                if code in current_by_code:
+                    continue
+                max_uses = old_invite.get("max_uses")
+                if max_uses and old_invite.get("uses", 0) == max_uses - 1:
+                    inviter = old_invite.get("inviter")
+                    print(f"👤 {member} was invited by {inviter} (invite {code}, used up and deleted)")
+                    break
 
         if inviter:
             member_inviters[member.id] = inviter
