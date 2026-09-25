@@ -6,9 +6,12 @@ How it works:
    - The bot posts an embed in the "VERIFICATION" text channel, pinging @everyone,
      with a Verify button and a Reject button. Anyone can click the buttons.
    - Shows who invited the member if available.
-2) When a member joins the "Waiting for Help" voice channel:
+2) When a member joins one of the "Waiting for Help" voice channels:
    - The bot posts a simpler embed (no invited-by / joined-server info) pinging @everyone,
      with a "Mark as Resolved" button. No roles are changed for this flow.
+   - Each waiting-for-help channel has its own emoji shown in the alert title, and can
+     independently turn the member-facing "Describe Issue" report form on or off
+     (see HELP_VC_CONFIG below).
 3) When anyone clicks Verify:
    - The "Verified" role and "Member" role (or any other roles you set) get added.
    - If the member already has the "Unverified" role, it gets removed.
@@ -40,9 +43,20 @@ VERIFICATION_CHANNEL_ID = 1542531178526146670  # channel where verify requests g
 WELCOME_CHANNEL_ID = None                        # welcome channel (optional - leave as None if you don't want a welcome message)
 WAITING_VC_ID = 1513904254535073883              # the "Waiting for Move" voice channel
 
-WAITING_FOR_HELP_VC_IDS = {1551163762084683866, 1517941411151085691, 1552746347113746453, 1552746364775956620}  # any of these voice channels trigger the help alert
 HELP_ALERT_CHANNEL_ID = 1551163762084683866  # channel where the staff alert gets posted (the Waiting for Help voice channel's own chat)
 MEMBER_HELP_PANEL_CHANNEL_ID = 1517941411151085691  # channel where the member-facing panel gets posted
+
+# Per-VC settings for the "waiting for help" flow:
+#   - emoji: shown in the staff alert embed title, so you can tell at a glance which
+#     channel triggered it
+#   - send_member_panel: whether the member-facing "Describe Issue" report form panel
+#     gets sent for this channel (False = staff alert only, no report form)
+HELP_VC_CONFIG = {
+    1551163762084683866: {"emoji": "🆘", "send_member_panel": True},
+    1517941411151085691: {"emoji": "🆘", "send_member_panel": True},
+    1552746347113746453: {"emoji": "🚫", "send_member_panel": False},  # report form off
+    1552746364775956620: {"emoji": "🚫", "send_member_panel": False},  # report form off
+}
 
 # Roles
 UNVERIFIED_ROLE_ID = 1513904174079934657  # removed from the member at verify time if they have it (not given automatically anymore)
@@ -382,17 +396,20 @@ async def send_verification_alert(member: discord.Member, voice_channel: discord
         print(f"❌ Failed to send verification message: {e}")
 
 
-async def send_help_alert(member: discord.Member, voice_channel: discord.VoiceChannel):
-    """Posts a 'needs help' embed - no invited-by/joined-server info, no role changes, just an alert + resolve button."""
+async def send_help_alert(member: discord.Member, voice_channel: discord.VoiceChannel, config: dict):
+    """Posts a 'needs help' embed - no invited-by/joined-server info, no role changes, just an
+    alert + resolve button. `config` is this VC's entry from HELP_VC_CONFIG (emoji + whether
+    the member-facing report form panel should be sent)."""
     help_channel = member.guild.get_channel(HELP_ALERT_CHANNEL_ID)
     if help_channel is None:
         print("⚠️ Couldn't find the help alert channel — check HELP_ALERT_CHANNEL_ID")
         return
 
-    print(f"📤 Sending help alert for {member}")
+    emoji = config.get("emoji", "🆘")
+    print(f"📤 Sending help alert for {member} ({emoji})")
 
     embed = discord.Embed(
-        title="Member needs help",
+        title=f"{emoji} Member needs help",
         description=(
             f"Member: {member.mention}\n"
             f"ID: `{member.id}`\n"
@@ -417,6 +434,10 @@ async def send_help_alert(member: discord.Member, voice_channel: discord.VoiceCh
         print(f"✅ Help alert sent for {member}")
     except Exception as e:
         print(f"❌ Failed to send help alert: {e}")
+
+    if not config.get("send_member_panel", True):
+        # Report form turned off for this channel — staff alert only.
+        return
 
     member_panel_channel = member.guild.get_channel(MEMBER_HELP_PANEL_CHANNEL_ID)
     if member_panel_channel is None:
@@ -478,10 +499,10 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
 
     if joined_id == WAITING_VC_ID and came_from_id != WAITING_VC_ID:
         await send_verification_alert(member, after.channel)
-    elif joined_id in WAITING_FOR_HELP_VC_IDS and came_from_id not in WAITING_FOR_HELP_VC_IDS:
-        await send_help_alert(member, after.channel)
-    elif came_from_id in WAITING_FOR_HELP_VC_IDS and joined_id not in WAITING_FOR_HELP_VC_IDS:
-        # Member left the Waiting for Help VC (got moved, or left on their own) — clean up their panel
+    elif joined_id in HELP_VC_CONFIG and came_from_id not in HELP_VC_CONFIG:
+        await send_help_alert(member, after.channel, HELP_VC_CONFIG[joined_id])
+    elif came_from_id in HELP_VC_CONFIG and joined_id not in HELP_VC_CONFIG:
+        # Member left a Waiting for Help VC (got moved, or left on their own) — clean up their panel
         await delete_member_help_panel(member.id)
 
 
