@@ -41,7 +41,8 @@ WELCOME_CHANNEL_ID = None                        # welcome channel (optional - l
 WAITING_VC_ID = 1513904254535073883              # the "Waiting for Move" voice channel
 
 WAITING_FOR_HELP_VC_IDS = {1551163762084683866, 1517941411151085691}  # any of these voice channels trigger the help alert
-HELP_ALERT_CHANNEL_ID = 1551163762084683866  # channel where help alerts get posted (the Waiting for Help voice channel's own chat)
+HELP_ALERT_CHANNEL_ID = 1551163762084683866  # channel where the staff alert gets posted (the Waiting for Help voice channel's own chat)
+MEMBER_HELP_PANEL_CHANNEL_ID = 1517941411151085691  # channel where the member-facing panel gets posted
 
 # Roles
 UNVERIFIED_ROLE_ID = 1513904174079934657  # removed from the member at verify time if they have it (not given automatically anymore)
@@ -62,6 +63,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # invite_cache[guild_id][code] = {"uses": int, "max_uses": int, "inviter": discord.User}
 invite_cache = {}
 member_inviters = {}  # {member_id: inviter_user_object}
+member_help_panels = {}  # {member_id: discord.Message} - the member-facing help panel, so it can be deleted later
 
 
 async def cache_invites(guild: discord.Guild):
@@ -187,6 +189,7 @@ class ResolveNoteModal(discord.ui.Modal, title="Resolve Help Request"):
         for item in self.view.children:
             item.disabled = True
         await interaction.response.edit_message(embed=embed, view=self.view)
+        await delete_member_help_panel(self.view.member_id)
 
 
 class HelpRequestView(discord.ui.View):
@@ -415,6 +418,11 @@ async def send_help_alert(member: discord.Member, voice_channel: discord.VoiceCh
     except Exception as e:
         print(f"❌ Failed to send help alert: {e}")
 
+    member_panel_channel = member.guild.get_channel(MEMBER_HELP_PANEL_CHANNEL_ID)
+    if member_panel_channel is None:
+        print("⚠️ Couldn't find the member panel channel — check MEMBER_HELP_PANEL_CHANNEL_ID")
+        return
+
     member_embed = discord.Embed(
         title="🆘 Support Request Received",
         description="A staff member will be with you shortly. Thanks for your patience.",
@@ -433,15 +441,30 @@ async def send_help_alert(member: discord.Member, voice_channel: discord.VoiceCh
     member_view = MemberHelpPanelView(member.id)
 
     try:
-        await send_with_retry(
-            help_channel,
+        panel_message = await send_with_retry(
+            member_panel_channel,
             content=member.mention,
             embed=member_embed,
             view=member_view,
         )
+        member_help_panels[member.id] = panel_message
         print(f"✅ Member panel sent for {member}")
     except Exception as e:
         print(f"❌ Failed to send member panel: {e}")
+
+
+async def delete_member_help_panel(member_id: int):
+    """Deletes the member's help panel message, if one is currently tracked."""
+    message = member_help_panels.pop(member_id, None)
+    if message is None:
+        return
+    try:
+        await message.delete()
+        print(f"🗑️ Deleted member panel for {member_id}")
+    except discord.NotFound:
+        pass
+    except Exception as e:
+        print(f"❌ Failed to delete member panel: {e}")
 
 
 @bot.event
@@ -457,6 +480,9 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
         await send_verification_alert(member, after.channel)
     elif joined_id in WAITING_FOR_HELP_VC_IDS and came_from_id not in WAITING_FOR_HELP_VC_IDS:
         await send_help_alert(member, after.channel)
+    elif came_from_id in WAITING_FOR_HELP_VC_IDS and joined_id not in WAITING_FOR_HELP_VC_IDS:
+        # Member left the Waiting for Help VC (got moved, or left on their own) — clean up their panel
+        await delete_member_help_panel(member.id)
 
 
 if not TOKEN:
