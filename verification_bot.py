@@ -6,6 +6,10 @@ How it works:
    - The bot posts an embed in the "VERIFICATION" text channel, pinging @everyone,
      with a Verify button and a Reject button. Anyone can click the buttons.
    - Shows who invited the member if available.
+   - If that member already has an unresolved alert out (e.g. they left and rejoined),
+     a duplicate alert is skipped.
+   - Accounts younger than NEW_ACCOUNT_THRESHOLD_HOURS get a ⚠️ New account warning.
+   - An alert nobody has acted on after STALE_AFTER_HOURS gets flagged orange as stale.
 2) When a member joins the "Waiting for Help" voice channel:
    - The bot posts a simpler embed (no invited-by / joined-server info) pinging @everyone,
      with a "Mark as Resolved" button. No roles are changed for this flow.
@@ -13,6 +17,8 @@ How it works:
    - The "Verified" role and "Member" role (or any other roles you set) get added.
    - If the member already has the "Unverified" role, it gets removed.
    - An optional welcome message is sent in the welcome channel (if you set one up).
+4) When anyone clicks Reject:
+   - A popup asks for an optional reason, which gets recorded on the embed.
 
 Requirements:
     pip install discord.py
@@ -26,7 +32,7 @@ import os
 import asyncio
 
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 # =========================== CONFIG ===========================
 # The token is read from an environment variable instead of being written here,
@@ -41,14 +47,18 @@ WELCOME_CHANNEL_ID = None                        # welcome channel (optional - l
 WAITING_VC_ID = 1513904254535073883              # the "Waiting for Move" voice channel
 
 WAITING_FOR_HELP_VC_IDS = {1551163762084683866, 1517941411151085691}  # any of these voice channels trigger the help alert
-HELP_ALERT_CHANNEL_ID = 1551163762084683866  # channel where the staff alert gets posted (the Waiting for Help voice channel's own chat)
-MEMBER_HELP_PANEL_CHANNEL_ID = 1517941411151085691  # channel where the member-facing panel gets posted
+HELP_ALERT_CHANNEL_ID = 1551163762084683866  # channel where help alerts get posted (the Waiting for Help voice channel's own chat)
 
 # Roles
 UNVERIFIED_ROLE_ID = 1513904174079934657  # removed from the member at verify time if they have it (not given automatically anymore)
 VERIFIED_ROLE_ID = 1513904156350353511    # given after verification
 
 EXTRA_ROLES_ON_VERIFY = [1513904151309058159]  # MEMBER role - given alongside Verified
+
+# Panel behavior
+NEW_ACCOUNT_THRESHOLD_HOURS = 24   # flag members whose account is younger than this
+STALE_AFTER_HOURS = 24             # flag a verification alert as stale after this long with no response
+STALE_CHECK_INTERVAL_MINUTES = 30  # how often to check for stale alerts
 # ================================================================
 
 intents = discord.Intents.default()
@@ -63,7 +73,10 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # invite_cache[guild_id][code] = {"uses": int, "max_uses": int, "inviter": discord.User}
 invite_cache = {}
 member_inviters = {}  # {member_id: inviter_user_object}
-member_help_panels = {}  # {member_id: discord.Message} - the member-facing help panel, so it can be deleted later
+
+# Verification requests waiting on a Verify/Reject click
+# pending_verifications[member_id] = {"channel_id": int, "message_id": int, "sent_at": datetime, "stale_flagged": bool}
+pending_verifications = {}
 
 
 async def cache_invites(guild: discord.Guild):
@@ -117,6 +130,7 @@ class VerifyView(discord.ui.View):
         guild = interaction.guild
         member = guild.get_member(self.member_id)
         if member is None:
+            pending_verifications.pop(self.member_id, None)
             return await interaction.followup.send("That member isn't in the server anymore (they may have left).", ephemeral=True)
 
         unverified_role = guild.get_role(UNVERIFIED_ROLE_ID)
@@ -144,6 +158,7 @@ class VerifyView(discord.ui.View):
         for item in self.children:
             item.disabled = True
         await interaction.followup.edit_message(interaction.message.id, embed=embed, view=self)
+        pending_verifications.pop(self.member_id, None)
 
         if WELCOME_CHANNEL_ID:
             welcome_channel = guild.get_channel(WELCOME_CHANNEL_ID)
@@ -152,16 +167,35 @@ class VerifyView(discord.ui.View):
 
     @discord.ui.button(label="❌ Reject", style=discord.ButtonStyle.danger)
     async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Defer first to prevent timeout
-        await interaction.response.defer()
+        await interaction.response.send_modal(RejectReasonModal(self))
 
+
+class RejectReasonModal(discord.ui.Modal, title="Reject Member"):
+    """Popup asking why the member is being rejected, shown when staff click Reject."""
+
+    reason = discord.ui.TextInput(
+        label="Reason (optional)",
+        style=discord.TextStyle.paragraph,
+        placeholder="Why is this member being rejected...",
+        required=False,
+        max_length=500,
+    )
+
+    def __init__(self, view: "VerifyView"):
+        super().__init__()
+        self.view = view
+
+    async def on_submit(self, interaction: discord.Interaction):
         embed = interaction.message.embeds[0]
         embed.color = discord.Color.red()
+        if self.reason.value:
+            embed.add_field(name="Reason", value=self.reason.value, inline=False)
         embed.add_field(name="Rejected", value=f"❌ {interaction.user.mention}", inline=False)
         embed.set_footer(text="Rejected ❌")
-        for item in self.children:
+        for item in self.view.children:
             item.disabled = True
-        await interaction.followup.edit_message(interaction.message.id, embed=embed, view=self)
+        await interaction.response.edit_message(embed=embed, view=self.view)
+        pending_verifications.pop(self.view.member_id, None)
 
 
 class ResolveNoteModal(discord.ui.Modal, title="Resolve Help Request"):
@@ -189,7 +223,6 @@ class ResolveNoteModal(discord.ui.Modal, title="Resolve Help Request"):
         for item in self.view.children:
             item.disabled = True
         await interaction.response.edit_message(embed=embed, view=self.view)
-        await delete_member_help_panel(self.view.member_id)
 
 
 class HelpRequestView(discord.ui.View):
@@ -205,54 +238,6 @@ class HelpRequestView(discord.ui.View):
         await interaction.response.send_modal(ResolveNoteModal(self))
 
 
-class DescribeIssueModal(discord.ui.Modal, title="Describe Your Issue"):
-    issue = discord.ui.TextInput(
-        label="What do you need help with?",
-        style=discord.TextStyle.paragraph,
-        placeholder="Briefly describe what's going on...",
-        required=True,
-        max_length=500,
-    )
-
-    def __init__(self, member_id: int):
-        super().__init__()
-        self.member_id = member_id
-
-    async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.send_message(
-            f"📝 *Issue from* <@{self.member_id}>: {self.issue.value}"
-        )
-
-
-class MemberHelpPanelView(discord.ui.View):
-    """Panel shown to the member themselves while they wait for staff."""
-
-    def __init__(self, member_id: int):
-        super().__init__(timeout=None)
-        self.member_id = member_id
-        self.children[0].custom_id = f"member_describe_{member_id}"
-        self.children[1].custom_id = f"member_cancel_{member_id}"
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.member_id:
-            await interaction.response.send_message("This panel isn't for you.", ephemeral=True)
-            return False
-        return True
-
-    @discord.ui.button(label="📝 Describe Issue", style=discord.ButtonStyle.primary)
-    async def describe(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(DescribeIssueModal(self.member_id))
-
-    @discord.ui.button(label="❌ Cancel Request", style=discord.ButtonStyle.secondary)
-    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
-        embed = interaction.message.embeds[0]
-        embed.color = discord.Color.greyple()
-        embed.set_field_at(0, name="Status", value="⚪ Cancelled by member", inline=True)
-        for item in self.children:
-            item.disabled = True
-        await interaction.response.edit_message(embed=embed, view=self)
-
-
 @bot.event
 async def on_ready():
     print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
@@ -262,6 +247,9 @@ async def on_ready():
         await cache_invites(guild)
     else:
         print(f"❌ Guild {GUILD_ID} not found!")
+
+    if not check_stale_verifications.is_running():
+        check_stale_verifications.start()
 
 
 @bot.event
@@ -341,6 +329,11 @@ async def send_verification_alert(member: discord.Member, voice_channel: discord
     if verified_role and verified_role in member.roles:
         return
 
+    # Skip if they already have an unresolved alert out there (e.g. they left and rejoined)
+    if member.id in pending_verifications:
+        print(f"⏭️ Skipping duplicate verification alert for {member} (already pending)")
+        return
+
     verification_channel = member.guild.get_channel(VERIFICATION_CHANNEL_ID)
     if verification_channel is None:
         print("⚠️ Couldn't find the verification channel — check VERIFICATION_CHANNEL_ID")
@@ -352,6 +345,13 @@ async def send_verification_alert(member: discord.Member, voice_channel: discord
     inviter = member_inviters.get(member.id)
     invited_by_text = f"Invited by: {inviter.mention}" if inviter else "Invited by: Unknown (vanity URL or unknown invite)"
 
+    account_age_hours = (discord.utils.utcnow() - member.created_at).total_seconds() / 3600
+    new_account_warning = (
+        f"\n⚠️ **New account** — created less than {NEW_ACCOUNT_THRESHOLD_HOURS}h ago"
+        if account_age_hours < NEW_ACCOUNT_THRESHOLD_HOURS
+        else ""
+    )
+
     embed = discord.Embed(
         title="Member awaiting verification",
         description=(
@@ -360,7 +360,8 @@ async def send_verification_alert(member: discord.Member, voice_channel: discord
             f"Account created: {discord.utils.format_dt(member.created_at, 'R')}\n"
             f"Joined server: {discord.utils.format_dt(member.joined_at, 'R')}\n"
             f"{invited_by_text}\n"
-            f"Joined voice channel: *{voice_channel.name}*"
+            f"Joined voice channel: **{voice_channel.name}**"
+            f"{new_account_warning}"
         ),
         color=discord.Color.gold(),
     )
@@ -370,13 +371,19 @@ async def send_verification_alert(member: discord.Member, voice_channel: discord
     view = VerifyView(member.id)
 
     try:
-        await send_with_retry(
+        sent_message = await send_with_retry(
             verification_channel,
             content="@everyone A member in the voice channel needs verification",
             embed=embed,
             view=view,
             allowed_mentions=discord.AllowedMentions(everyone=True),
         )
+        pending_verifications[member.id] = {
+            "channel_id": verification_channel.id,
+            "message_id": sent_message.id,
+            "sent_at": discord.utils.utcnow(),
+            "stale_flagged": False,
+        }
         print(f"✅ Verification message sent for {member}")
     except Exception as e:
         print(f"❌ Failed to send verification message: {e}")
@@ -397,7 +404,7 @@ async def send_help_alert(member: discord.Member, voice_channel: discord.VoiceCh
             f"Member: {member.mention}\n"
             f"ID: `{member.id}`\n"
             f"Account created: {discord.utils.format_dt(member.created_at, 'R')}\n"
-            f"Joined voice channel: *{voice_channel.name}*"
+            f"Joined voice channel: **{voice_channel.name}**"
         ),
         color=discord.Color.gold(),
     )
@@ -418,54 +425,6 @@ async def send_help_alert(member: discord.Member, voice_channel: discord.VoiceCh
     except Exception as e:
         print(f"❌ Failed to send help alert: {e}")
 
-    member_panel_channel = member.guild.get_channel(MEMBER_HELP_PANEL_CHANNEL_ID)
-    if member_panel_channel is None:
-        print("⚠️ Couldn't find the member panel channel — check MEMBER_HELP_PANEL_CHANNEL_ID")
-        return
-
-    member_embed = discord.Embed(
-        title="🆘 Support Request Received",
-        description="A staff member will be with you shortly. Thanks for your patience.",
-        color=discord.Color.blurple(),
-    )
-    member_embed.set_thumbnail(url=member.display_avatar.url)
-    member_embed.add_field(name="Status", value="🟡 Waiting for staff", inline=True)
-    member_embed.add_field(name="Estimated Wait", value="~3-5 minutes", inline=True)
-    member_embed.add_field(name="Tip", value="Use the button below to describe your issue so staff can help faster", inline=False)
-    member_embed.set_footer(
-        text="ELITE LEADERS COMMUNITY • Support System",
-        icon_url=member.guild.icon.url if member.guild.icon else None,
-    )
-    member_embed.timestamp = discord.utils.utcnow()
-
-    member_view = MemberHelpPanelView(member.id)
-
-    try:
-        panel_message = await send_with_retry(
-            member_panel_channel,
-            content=member.mention,
-            embed=member_embed,
-            view=member_view,
-        )
-        member_help_panels[member.id] = panel_message
-        print(f"✅ Member panel sent for {member}")
-    except Exception as e:
-        print(f"❌ Failed to send member panel: {e}")
-
-
-async def delete_member_help_panel(member_id: int):
-    """Deletes the member's help panel message, if one is currently tracked."""
-    message = member_help_panels.pop(member_id, None)
-    if message is None:
-        return
-    try:
-        await message.delete()
-        print(f"🗑️ Deleted member panel for {member_id}")
-    except discord.NotFound:
-        pass
-    except Exception as e:
-        print(f"❌ Failed to delete member panel: {e}")
-
 
 @bot.event
 async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
@@ -480,9 +439,49 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
         await send_verification_alert(member, after.channel)
     elif joined_id in WAITING_FOR_HELP_VC_IDS and came_from_id not in WAITING_FOR_HELP_VC_IDS:
         await send_help_alert(member, after.channel)
-    elif came_from_id in WAITING_FOR_HELP_VC_IDS and joined_id not in WAITING_FOR_HELP_VC_IDS:
-        # Member left the Waiting for Help VC (got moved, or left on their own) — clean up their panel
-        await delete_member_help_panel(member.id)
+
+
+@tasks.loop(minutes=STALE_CHECK_INTERVAL_MINUTES)
+async def check_stale_verifications():
+    """Flags any verification alert nobody has acted on after STALE_AFTER_HOURS."""
+    now = discord.utils.utcnow()
+    for member_id, info in list(pending_verifications.items()):
+        if info.get("stale_flagged"):
+            continue
+        age_hours = (now - info["sent_at"]).total_seconds() / 3600
+        if age_hours < STALE_AFTER_HOURS:
+            continue
+
+        channel = bot.get_channel(info["channel_id"])
+        if channel is None:
+            continue
+
+        try:
+            message = await channel.fetch_message(info["message_id"])
+        except discord.NotFound:
+            pending_verifications.pop(member_id, None)
+            continue
+        except discord.HTTPException:
+            continue
+
+        if not message.embeds:
+            continue
+
+        embed = message.embeds[0]
+        embed.color = discord.Color.orange()
+        embed.add_field(name="Stale", value=f"⏰ No response in over {STALE_AFTER_HOURS}h", inline=False)
+
+        try:
+            await message.edit(embed=embed)
+            info["stale_flagged"] = True
+            print(f"⏰ Flagged verification alert for member {member_id} as stale")
+        except discord.HTTPException:
+            continue
+
+
+@check_stale_verifications.before_loop
+async def before_check_stale_verifications():
+    await bot.wait_until_ready()
 
 
 if not TOKEN:
