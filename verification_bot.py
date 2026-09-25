@@ -202,6 +202,54 @@ class HelpRequestView(discord.ui.View):
         await interaction.response.send_modal(ResolveNoteModal(self))
 
 
+class DescribeIssueModal(discord.ui.Modal, title="Describe Your Issue"):
+    issue = discord.ui.TextInput(
+        label="What do you need help with?",
+        style=discord.TextStyle.paragraph,
+        placeholder="Briefly describe what's going on...",
+        required=True,
+        max_length=500,
+    )
+
+    def __init__(self, member_id: int):
+        super().__init__()
+        self.member_id = member_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.send_message(
+            f"📝 *Issue from* <@{self.member_id}>: {self.issue.value}"
+        )
+
+
+class MemberHelpPanelView(discord.ui.View):
+    """Panel shown to the member themselves while they wait for staff."""
+
+    def __init__(self, member_id: int):
+        super().__init__(timeout=None)
+        self.member_id = member_id
+        self.children[0].custom_id = f"member_describe_{member_id}"
+        self.children[1].custom_id = f"member_cancel_{member_id}"
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.member_id:
+            await interaction.response.send_message("This panel isn't for you.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="📝 Describe Issue", style=discord.ButtonStyle.primary)
+    async def describe(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(DescribeIssueModal(self.member_id))
+
+    @discord.ui.button(label="❌ Cancel Request", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        embed = interaction.message.embeds[0]
+        embed.color = discord.Color.greyple()
+        embed.set_field_at(0, name="Status", value="⚪ Cancelled by member", inline=True)
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(embed=embed, view=self)
+
+
 @bot.event
 async def on_ready():
     print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
@@ -309,7 +357,7 @@ async def send_verification_alert(member: discord.Member, voice_channel: discord
             f"Account created: {discord.utils.format_dt(member.created_at, 'R')}\n"
             f"Joined server: {discord.utils.format_dt(member.joined_at, 'R')}\n"
             f"{invited_by_text}\n"
-            f"Joined voice channel: **{voice_channel.name}**"
+            f"Joined voice channel: *{voice_channel.name}*"
         ),
         color=discord.Color.gold(),
     )
@@ -346,7 +394,7 @@ async def send_help_alert(member: discord.Member, voice_channel: discord.VoiceCh
             f"Member: {member.mention}\n"
             f"ID: `{member.id}`\n"
             f"Account created: {discord.utils.format_dt(member.created_at, 'R')}\n"
-            f"Joined voice channel: **{voice_channel.name}**"
+            f"Joined voice channel: *{voice_channel.name}*"
         ),
         color=discord.Color.gold(),
     )
@@ -366,6 +414,34 @@ async def send_help_alert(member: discord.Member, voice_channel: discord.VoiceCh
         print(f"✅ Help alert sent for {member}")
     except Exception as e:
         print(f"❌ Failed to send help alert: {e}")
+
+    member_embed = discord.Embed(
+        title="🆘 Support Request Received",
+        description="A staff member will be with you shortly. Thanks for your patience.",
+        color=discord.Color.blurple(),
+    )
+    member_embed.set_thumbnail(url=member.display_avatar.url)
+    member_embed.add_field(name="Status", value="🟡 Waiting for staff", inline=True)
+    member_embed.add_field(name="Estimated Wait", value="~3-5 minutes", inline=True)
+    member_embed.add_field(name="Tip", value="Use the button below to describe your issue so staff can help faster", inline=False)
+    member_embed.set_footer(
+        text="ELITE LEADERS COMMUNITY • Support System",
+        icon_url=member.guild.icon.url if member.guild.icon else None,
+    )
+    member_embed.timestamp = discord.utils.utcnow()
+
+    member_view = MemberHelpPanelView(member.id)
+
+    try:
+        await send_with_retry(
+            help_channel,
+            content=member.mention,
+            embed=member_embed,
+            view=member_view,
+        )
+        print(f"✅ Member panel sent for {member}")
+    except Exception as e:
+        print(f"❌ Failed to send member panel: {e}")
 
 
 @bot.event
