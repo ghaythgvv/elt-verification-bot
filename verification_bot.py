@@ -12,6 +12,10 @@ How it works:
    - Each waiting-for-help channel has its own emoji shown in the alert title, and can
      independently turn the member-facing "Describe Issue" report form on or off
      (see HELP_VC_CONFIG below).
+   - The member-facing panel is never auto-deleted (not on resolve, not on leaving the VC) —
+     it stays up until a staff member removes it manually.
+   - When the member submits "Describe Issue", it's posted as an embed to
+     ISSUE_REPORTS_CHANNEL_ID, and the member gets a private (ephemeral) confirmation.
 3) When a member joins one of the "REPORT" voice channels:
    - No message is sent anywhere. Instead the bot prefixes that member's own server
      nickname with an alert emoji (⛔) while they're waiting in the channel, and removes
@@ -49,16 +53,16 @@ WAITING_VC_ID = 1513904254535073883              # the "Waiting for Move" voice 
 
 HELP_ALERT_CHANNEL_ID = 1551163762084683866  # channel where the staff alert gets posted (the Waiting for Help voice channel's own chat)
 MEMBER_HELP_PANEL_CHANNEL_ID = 1517941411151085691  # channel where the member-facing panel gets posted
+ISSUE_REPORTS_CHANNEL_ID = 1553196616146493460  # channel where "Describe Issue" submissions get posted
 
 # Per-VC settings for the "waiting for help" flow (staff alert + optional member panel):
 #   - emoji: shown in the staff alert embed title, so you can tell at a glance which
 #     channel triggered it
 #   - send_member_panel: whether the member-facing "Describe Issue" report form panel
 #     gets sent for this channel (False = staff alert only, no report form)
-# Currently empty - none of the "REPORT" voice channels use this flow anymore, they use
-# the silent emoji-in-name flow below instead (REPORT_VC_IDS). Add a VC ID here only if
-# you want the old "post an alert + optional report form" behavior for it.
-HELP_VC_CONFIG = {}
+HELP_VC_CONFIG = {
+    1517941411151085691: {"emoji": "🆘", "send_member_panel": True},
+}
 
 # The "REPORT" voice channels: no message is ever sent for these. Instead, while a member
 # is waiting in one of these channels, the bot prefixes THEIR OWN nickname with
@@ -89,7 +93,6 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # invite_cache[guild_id][code] = {"uses": int, "max_uses": int, "inviter": discord.User}
 invite_cache = {}
 member_inviters = {}  # {member_id: inviter_user_object}
-member_help_panels = {}  # {member_id: discord.Message} - the member-facing help panel, so it can be deleted later
 
 # report_vc_base_nicknames[member_id] = that member's nickname (or None, meaning "no
 # nickname set") with REPORT_VC_EMOJI stripped off, so we can restore it exactly once
@@ -256,7 +259,6 @@ class ResolveNoteModal(discord.ui.Modal, title="Resolve Help Request"):
         for item in self.view.children:
             item.disabled = True
         await interaction.response.edit_message(embed=embed, view=self.view)
-        await delete_member_help_panel(self.view.member_id)
 
 
 class HelpRequestView(discord.ui.View):
@@ -286,8 +288,33 @@ class DescribeIssueModal(discord.ui.Modal, title="Describe Your Issue"):
         self.member_id = member_id
 
     async def on_submit(self, interaction: discord.Interaction):
+        member = interaction.guild.get_member(self.member_id) if interaction.guild else None
+        reports_channel = interaction.guild.get_channel(ISSUE_REPORTS_CHANNEL_ID) if interaction.guild else None
+
+        if reports_channel is None:
+            print("⚠️ Couldn't find the issue reports channel — check ISSUE_REPORTS_CHANNEL_ID")
+        else:
+            embed = discord.Embed(
+                title="📝 New Issue Report",
+                description=self.issue.value,
+                color=discord.Color.orange(),
+            )
+            embed.add_field(name="Member", value=f"<@{self.member_id}>", inline=True)
+            embed.add_field(name="ID", value=f"`{self.member_id}`", inline=True)
+            if member:
+                embed.set_thumbnail(url=member.display_avatar.url)
+            embed.set_footer(text="Submitted via the member help panel")
+            embed.timestamp = discord.utils.utcnow()
+            try:
+                await send_with_retry(reports_channel, embed=embed)
+                print(f"✅ Issue report sent for {member or self.member_id}")
+            except Exception as e:
+                print(f"❌ Failed to send issue report: {e}")
+
+        # Ephemeral - only the member who submitted it sees this confirmation.
         await interaction.response.send_message(
-            f"📝 *Issue from* <@{self.member_id}>: {self.issue.value}"
+            "✅ Thanks — your issue has been sent to staff. Someone will be with you shortly.",
+            ephemeral=True,
         )
 
 
@@ -529,24 +556,9 @@ async def send_help_alert(member: discord.Member, voice_channel: discord.VoiceCh
             embed=member_embed,
             view=member_view,
         )
-        member_help_panels[member.id] = panel_message
         print(f"✅ Member panel sent for {member}")
     except Exception as e:
         print(f"❌ Failed to send member panel: {e}")
-
-
-async def delete_member_help_panel(member_id: int):
-    """Deletes the member's help panel message, if one is currently tracked."""
-    message = member_help_panels.pop(member_id, None)
-    if message is None:
-        return
-    try:
-        await message.delete()
-        print(f"🗑️ Deleted member panel for {member_id}")
-    except discord.NotFound:
-        pass
-    except Exception as e:
-        print(f"❌ Failed to delete member panel: {e}")
 
 
 @bot.event
@@ -569,10 +581,7 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
     elif joined_id in REPORT_VC_IDS and isinstance(after.channel, (discord.VoiceChannel, discord.StageChannel)):
         await set_report_vc_alert(member, True)
 
-    if came_from_id in HELP_VC_CONFIG:
-        # Member left a Waiting for Help VC (got moved, or left on their own) — clean up their panel
-        await delete_member_help_panel(member.id)
-    elif came_from_id in REPORT_VC_IDS and isinstance(before.channel, (discord.VoiceChannel, discord.StageChannel)):
+    if came_from_id in REPORT_VC_IDS and isinstance(before.channel, (discord.VoiceChannel, discord.StageChannel)):
         await set_report_vc_alert(member, False)
 
 
