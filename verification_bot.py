@@ -274,6 +274,23 @@ class HelpRequestView(discord.ui.View):
         await interaction.response.send_modal(ResolveNoteModal(self))
 
 
+class IssueReportView(discord.ui.View):
+    """Simple 'Mark as Seen' button for issue reports, so staff can tell what's already
+    been looked at without anyone having to delete or reply to the embed."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="✅ Mark as Seen", style=discord.ButtonStyle.success, custom_id="issue_report_seen")
+    async def mark_seen(self, interaction: discord.Interaction, button: discord.ui.Button):
+        embed = interaction.message.embeds[0]
+        embed.color = discord.Color.green()
+        embed.add_field(name="Seen by", value=interaction.user.mention, inline=False)
+        button.label = "✅ Seen"
+        button.disabled = True
+        await interaction.response.edit_message(embed=embed, view=self)
+
+
 class DescribeIssueModal(discord.ui.Modal, title="Describe Your Issue"):
     issue = discord.ui.TextInput(
         label="What do you need help with?",
@@ -296,17 +313,19 @@ class DescribeIssueModal(discord.ui.Modal, title="Describe Your Issue"):
         else:
             embed = discord.Embed(
                 title="📝 New Issue Report",
-                description=self.issue.value,
+                description=f">>> {self.issue.value}",
                 color=discord.Color.orange(),
             )
-            embed.add_field(name="Member", value=f"<@{self.member_id}>", inline=True)
-            embed.add_field(name="ID", value=f"`{self.member_id}`", inline=True)
             if member:
-                embed.set_thumbnail(url=member.display_avatar.url)
-            embed.set_footer(text="Submitted via the member help panel")
+                embed.set_author(name=f"{member.display_name} ({member})", icon_url=member.display_avatar.url)
+            else:
+                embed.set_author(name=f"Unknown member ({self.member_id})")
+            embed.add_field(name="Member", value=f"<@{self.member_id}>", inline=True)
+            embed.add_field(name="User ID", value=f"`{self.member_id}`", inline=True)
+            embed.set_footer(text="Member help panel")
             embed.timestamp = discord.utils.utcnow()
             try:
-                await send_with_retry(reports_channel, embed=embed)
+                await send_with_retry(reports_channel, embed=embed, view=IssueReportView())
                 print(f"✅ Issue report sent for {member or self.member_id}")
             except Exception as e:
                 print(f"❌ Failed to send issue report: {e}")
