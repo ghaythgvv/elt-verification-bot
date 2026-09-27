@@ -51,8 +51,8 @@ VERIFICATION_CHANNEL_ID = 1542531178526146670  # channel where verify requests g
 WELCOME_CHANNEL_ID = None                        # welcome channel (optional - leave as None if you don't want a welcome message)
 WAITING_VC_ID = 1513904254535073883              # the "Waiting for Move" voice channel
 
-HELP_ALERT_CHANNEL_ID = 1553786062579699722  # channel where the staff alert gets posted (member is tagged here instead of @everyone)
-MEMBER_HELP_PANEL_CHANNEL_ID = 1553786062579699722  # channel where the member-facing panel gets posted (same channel as the alert)
+HELP_ALERT_CHANNEL_ID = 1551163762084683866  # channel where the staff alert gets posted (the Waiting for Help voice channel's own chat)
+MEMBER_HELP_PANEL_CHANNEL_ID = 1553786062579699722  # channel where the member-facing panel gets posted
 ISSUE_REPORTS_CHANNEL_ID = 1553196616146493460  # channel where "Describe Issue" submissions get posted
 
 # Per-VC settings for the "waiting for help" flow (staff alert + optional member panel):
@@ -533,10 +533,10 @@ async def send_help_alert(member: discord.Member, voice_channel: discord.VoiceCh
     try:
         await send_with_retry(
             help_channel,
-            content=f"{member.mention} needs help",
+            content="@everyone A member in the voice channel needs help",
             embed=embed,
             view=view,
-            allowed_mentions=discord.AllowedMentions(users=True),
+            allowed_mentions=discord.AllowedMentions(everyone=True),
         )
         print(f"✅ Help alert sent for {member}")
     except Exception as e:
