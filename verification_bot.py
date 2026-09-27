@@ -99,6 +99,13 @@ member_inviters = {}  # {member_id: inviter_user_object}
 # they leave the REPORT voice channel.
 report_vc_base_nicknames = {}
 
+# help_panels[member_id] = {"message": discord.Message, "view": MemberHelpPanelView,
+#                            "described": bool, "closed": bool}
+# Tracks the member-facing "waiting for help" panel so we can update its Status field
+# when the member leaves/gets moved, and so we can auto-delete it if they never
+# describe their issue.
+help_panels = {}
+
 
 async def cache_invites(guild: discord.Guild):
     """Cache all invites for a guild - their use counts, use limits, and inviters."""
@@ -330,6 +337,10 @@ class DescribeIssueModal(discord.ui.Modal, title="Describe Your Issue"):
             except Exception as e:
                 print(f"❌ Failed to send issue report: {e}")
 
+        panel_entry = help_panels.get(self.member_id)
+        if panel_entry is not None:
+            panel_entry["described"] = True
+
         # Ephemeral - only the member who submitted it sees this confirmation.
         await interaction.response.send_message(
             "✅ Thanks — your issue has been sent to staff. Someone will be with you shortly.",
@@ -364,6 +375,7 @@ class MemberHelpPanelView(discord.ui.View):
         for item in self.children:
             item.disabled = True
         await interaction.response.edit_message(embed=embed, view=self)
+        help_panels.pop(self.member_id, None)
 
 
 @bot.event
@@ -552,13 +564,13 @@ async def send_help_alert(member: discord.Member, voice_channel: discord.VoiceCh
         return
 
     member_embed = discord.Embed(
-        title="🆘 Support Request Received",
+        title="Support Request Received",
         description="A staff member will be with you shortly. Thanks for your patience.",
         color=discord.Color.blurple(),
     )
     member_embed.set_thumbnail(url=member.display_avatar.url)
     member_embed.add_field(name="Status", value="🟡 Waiting for staff", inline=True)
-    member_embed.add_field(name="Estimated Wait", value="~3-5 minutes", inline=True)
+    member_embed.add_field(name="Estimated Wait", value="~1-5 minutes", inline=True)
     member_embed.add_field(name="Tip", value="Use the button below to describe your issue so staff can help faster", inline=False)
     member_embed.set_footer(
         text="ELITE LEADERS COMMUNITY • Support System",
@@ -576,8 +588,62 @@ async def send_help_alert(member: discord.Member, voice_channel: discord.VoiceCh
             view=member_view,
         )
         print(f"✅ Member panel sent for {member}")
+        help_panels[member.id] = {
+            "message": panel_message,
+            "view": member_view,
+            "described": False,
+            "closed": False,
+        }
+        bot.loop.create_task(auto_delete_help_panel(member.id, panel_message.id))
     except Exception as e:
         print(f"❌ Failed to send member panel: {e}")
+
+
+async def auto_delete_help_panel(member_id: int, message_id: int):
+    """If the member never clicks 'Describe Issue' within 10 minutes, delete their
+    panel so stale requests don't pile up. Skipped if they already described their
+    issue, or the panel was already closed out (cancelled / resolved / they left)."""
+    await asyncio.sleep(600)  # 10 minutes
+
+    entry = help_panels.get(member_id)
+    if entry is None or entry["message"].id != message_id:
+        return  # already handled, or a newer panel replaced this one
+    if entry["described"] or entry["closed"]:
+        return
+
+    try:
+        await entry["message"].delete()
+        print(f"🗑️ Auto-deleted help panel for member {member_id} (no issue described within 10 min)")
+    except discord.NotFound:
+        pass
+    except discord.HTTPException as e:
+        print(f"⚠️ Failed to auto-delete help panel: {e}")
+
+    help_panels.pop(member_id, None)
+
+
+async def update_help_panel_status(member_id: int, status: str, color: discord.Color):
+    """Edits a member's help panel Status field and disables its buttons, used when
+    they leave the voice channel or get moved elsewhere. Marks the panel closed so
+    the 10-minute auto-delete no longer fires."""
+    entry = help_panels.get(member_id)
+    if entry is None or entry["closed"]:
+        return
+    entry["closed"] = True
+
+    message = entry["message"]
+    view = entry["view"]
+    try:
+        embed = message.embeds[0]
+        embed.color = color
+        embed.set_field_at(0, name="Status", value=status, inline=True)
+        for item in view.children:
+            item.disabled = True
+        await message.edit(embed=embed, view=view)
+    except discord.NotFound:
+        pass
+    except discord.HTTPException as e:
+        print(f"⚠️ Failed to update help panel status: {e}")
 
 
 @bot.event
@@ -592,6 +658,16 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
 
     if joined_id == came_from_id:
         return  # no actual channel change (e.g. mute/deafen toggle)
+
+    # If this member has an open "waiting for help" panel, reflect what happened to
+    # them: fully disconnecting counts as giving up (red), while landing in a
+    # different channel counts as staff having moved them to help (green). Once
+    # either happens the panel is closed and no longer auto-deletes.
+    if member.id in help_panels:
+        if joined_id is None:
+            await update_help_panel_status(member.id, "🔴 Left the queue", discord.Color.red())
+        elif came_from_id is not None:
+            await update_help_panel_status(member.id, "🟢 Resolved — moved by staff", discord.Color.green())
 
     if joined_id == WAITING_VC_ID:
         await send_verification_alert(member, after.channel)
