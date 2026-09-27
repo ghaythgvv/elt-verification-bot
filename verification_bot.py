@@ -600,7 +600,14 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
     elif joined_id in REPORT_VC_IDS and isinstance(after.channel, (discord.VoiceChannel, discord.StageChannel)):
         await set_report_vc_alert(member, True)
 
-    if came_from_id in REPORT_VC_IDS and isinstance(before.channel, (discord.VoiceChannel, discord.StageChannel)):
+    # Only clear the REPORT-VC emoji if they *didn't* move straight into another REPORT
+    # channel — otherwise this would immediately undo the "add emoji" call right above,
+    # leaving the member with no emoji even though they're still waiting in a REPORT VC.
+    if (
+        came_from_id in REPORT_VC_IDS
+        and joined_id not in REPORT_VC_IDS
+        and isinstance(before.channel, (discord.VoiceChannel, discord.StageChannel))
+    ):
         await set_report_vc_alert(member, False)
 
 
