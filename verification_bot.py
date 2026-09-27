@@ -61,7 +61,7 @@ ISSUE_REPORTS_CHANNEL_ID = 1553196616146493460  # channel where "Describe Issue"
 #   - send_member_panel: whether the member-facing "Describe Issue" report form panel
 #     gets sent for this channel (False = staff alert only, no report form)
 HELP_VC_CONFIG = {
-    1517941411151085691: {"emoji": "🆘", "send_member_panel": True},
+    1517941411151085691: {"emoji": "🔔", "send_member_panel": True},
 }
 
 # The "REPORT" voice channels: no message is ever sent for these. Instead, while a member
@@ -524,21 +524,23 @@ async def send_help_alert(member: discord.Member, voice_channel: discord.VoiceCh
         print("⚠️ Couldn't find the help alert channel — check HELP_ALERT_CHANNEL_ID")
         return
 
-    emoji = config.get("emoji", "🆘")
+    emoji = config.get("emoji", "🔔")
     print(f"📤 Sending help alert for {member} ({emoji})")
 
     embed = discord.Embed(
-        title=f"{emoji} Member needs help",
-        description=(
-            f"Member: {member.mention}\n"
-            f"ID: `{member.id}`\n"
-            f"Account created: {discord.utils.format_dt(member.created_at, 'R')}\n"
-            f"Joined voice channel: *{voice_channel.name}*"
-        ),
+        title=f"{emoji} Member needs help".strip(),
         color=discord.Color.gold(),
     )
     embed.set_thumbnail(url=member.display_avatar.url)
-    embed.set_footer(text="Click Mark as Resolved once this is handled")
+    embed.add_field(name="Member", value=member.mention, inline=True)
+    embed.add_field(name="ID", value=f"`{member.id}`", inline=True)
+    embed.add_field(name="Account Created", value=discord.utils.format_dt(member.created_at, "R"), inline=True)
+    embed.add_field(name="Voice Channel", value=f"*{voice_channel.name}*", inline=False)
+    embed.set_footer(
+        text="ELITE LEADERS COMMUNITY • Click Mark as Resolved once this is handled",
+        icon_url=member.guild.icon.url if member.guild.icon else None,
+    )
+    embed.timestamp = discord.utils.utcnow()
 
     view = HelpRequestView(member.id)
 
