@@ -655,6 +655,9 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
     if member.guild.id != GUILD_ID:
         return
 
+    if member.bot:
+        return  # bots (including this one) never trigger verification, help, or report alerts
+
     joined_id = after.channel.id if after.channel else None
     came_from_id = before.channel.id if before.channel else None
 
