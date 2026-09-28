@@ -25,12 +25,16 @@ How it works:
    - If the member already has the "Unverified" role, it gets removed.
    - An optional welcome message is sent in the welcome channel (if you set one up).
 
+All buttons are PERSISTENT: they keep working after the bot restarts or redeploys
+(they are re-registered on startup using dynamic items), so you will no longer get
+"ELITE SYSTEM didn't respond in time" on older messages.
+
 Requirements:
-    pip install discord.py
+    pip install "discord.py>=2.4"
 
 Before running:
     - Enable SERVER MEMBERS INTENT for your bot in the Discord Developer Portal.
-    - Put your token in place of "PUT_YOUR_BOT_TOKEN_HERE" below (from Developer Portal > your bot > Bot > Token).
+    - Set DISCORD_TOKEN as an environment variable (Railway > Variables).
 """
 
 import os
@@ -82,10 +86,11 @@ EXTRA_ROLES_ON_VERIFY = [1513904151309058159]  # MEMBER role - given alongside V
 # ================================================================
 
 intents = discord.Intents.default()
-intents.members = True
+intents.members = True      # needed for member lookups / nicknames (enable in the Developer Portal)
 intents.voice_states = True  # needed to detect members joining the voice channel
-intents.message_content = True  # ensure message content intent is enabled
-intents.invites = True  # needed to track invites
+intents.invites = True      # needed to track invites
+# NOTE: message_content is NOT needed (the bot reads no messages), and asking for it
+# without enabling it in the portal would crash the bot on startup.
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -99,12 +104,12 @@ member_inviters = {}  # {member_id: inviter_user_object}
 # they leave the REPORT voice channel.
 report_vc_base_nicknames = {}
 
-# help_panels[member_id] = {"message": discord.Message, "view": MemberHelpPanelView,
-#                            "described": bool, "closed": bool}
+# help_panels[member_id] = {"message": discord.Message, "described": bool}
 # Tracks the member-facing "waiting for help" panel so we can update its Status field
-# when the member leaves/gets moved, and so we can auto-delete it if they never
-# describe their issue.
+# when the member leaves/gets moved out of the help channel.
 help_panels = {}
+
+_startup_sync_done = False  # on_ready can fire many times (reconnects) - only sync nicknames once
 
 
 async def cache_invites(guild: discord.Guild):
@@ -112,12 +117,14 @@ async def cache_invites(guild: discord.Guild):
     try:
         invites = await guild.invites()
         invite_cache[guild.id] = {
-            invite.code: {"uses": invite.uses, "max_uses": invite.max_uses, "inviter": invite.inviter}
+            invite.code: {"uses": invite.uses or 0, "max_uses": invite.max_uses, "inviter": invite.inviter}
             for invite in invites
         }
         print(f"✅ Cached {len(invites)} invites for guild {guild.id}")
     except discord.Forbidden:
         print(f"⚠️ Bot doesn't have permission to view invites in guild {guild.id}")
+    except discord.HTTPException as e:
+        print(f"⚠️ Failed to cache invites: {e}")
 
 
 async def send_with_retry(channel, **kwargs):
@@ -128,15 +135,11 @@ async def send_with_retry(channel, **kwargs):
     for attempt in range(max_attempts):
         try:
             return await channel.send(**kwargs)
-        except discord.errors.HTTPException as e:
-            if e.status == 429:  # Rate limited
-                if attempt < max_attempts - 1:
-                    delay = backoff_delays[attempt]
-                    print(f"⏳ Rate limited, retrying in {delay}s (attempt {attempt + 1}/{max_attempts})")
-                    await asyncio.sleep(delay)
-                else:
-                    print(f"❌ Failed to send message after {max_attempts} attempts")
-                    raise
+        except discord.HTTPException as e:
+            if e.status == 429 and attempt < max_attempts - 1:  # Rate limited
+                delay = backoff_delays[attempt]
+                print(f"⏳ Rate limited, retrying in {delay}s (attempt {attempt + 1}/{max_attempts})")
+                await asyncio.sleep(delay)
             else:
                 raise
 
@@ -150,6 +153,10 @@ def get_report_vc_base_nickname(member: discord.Member) -> str | None:
         prefix = f"{REPORT_VC_EMOJI} "
         if nick and nick.startswith(prefix):
             nick = nick[len(prefix):]
+            # We used the username as a stand-in when they had no nickname, so after a
+            # restart "⛔ username" should go back to "no nickname", not to "username".
+            if not nick or nick == member.name:
+                nick = None
         report_vc_base_nicknames[member.id] = nick
     return report_vc_base_nicknames[member.id]
 
@@ -165,6 +172,8 @@ async def set_report_vc_alert(member: discord.Member, active: bool):
         target_nick = base_nick
 
     if member.nick == target_nick:
+        if not active:
+            report_vc_base_nicknames.pop(member.id, None)
         return  # already in the right state
 
     try:
@@ -176,72 +185,116 @@ async def set_report_vc_alert(member: discord.Member, active: bool):
             report_vc_base_nicknames.pop(member.id, None)
     except discord.Forbidden:
         print(f"⚠️ Bot doesn't have permission to change {member}'s nickname")
+        if not active:
+            report_vc_base_nicknames.pop(member.id, None)
     except discord.HTTPException as e:
         print(f"⚠️ Failed to update {member}'s nickname: {e}")
 
 
-class VerifyView(discord.ui.View):
-    """Verify/Reject buttons. timeout=None so they keep working even after a bot restart."""
+# ====================== Persistent buttons (survive restarts) ======================
+# Each button is a DynamicItem: the member ID lives inside the custom_id, and the bot
+# rebuilds the button from that id when someone clicks it — even on messages sent
+# before the bot restarted. The custom_id formats are the same as the old ones, so
+# messages that were already posted start working again too.
 
-    def __init__(self, member_id: int):
-        super().__init__(timeout=None)
-        self.member_id = member_id
-        self.children[0].custom_id = f"verify_accept_{member_id}"
-        self.children[1].custom_id = f"verify_reject_{member_id}"
+def _already_done(message: discord.Message, done_footers: tuple[str, ...]) -> bool:
+    return bool(message.embeds and message.embeds[0].footer.text in done_footers)
 
-    @discord.ui.button(label="✅ Verify", style=discord.ButtonStyle.success)
-    async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Defer first to prevent timeout
-        await interaction.response.defer()
 
-        guild = interaction.guild
-        member = guild.get_member(self.member_id)
-        if member is None:
-            return await interaction.followup.send("That member isn't in the server anymore (they may have left).", ephemeral=True)
-
-        unverified_role = guild.get_role(UNVERIFIED_ROLE_ID)
-        verified_role = guild.get_role(VERIFIED_ROLE_ID)
-
-        try:
-            if unverified_role and unverified_role in member.roles:
-                await member.remove_roles(unverified_role, reason=f"Verified by {interaction.user}")
-            if verified_role:
-                await member.add_roles(verified_role, reason=f"Verified by {interaction.user}")
-            for rid in EXTRA_ROLES_ON_VERIFY:
-                r = guild.get_role(rid)
-                if r:
-                    await member.add_roles(r, reason="Extra role after verification")
-        except discord.Forbidden:
-            return await interaction.followup.send(
-                "The bot doesn't have enough permission to change roles (make sure the bot's role is above the roles it manages).",
-                ephemeral=True,
+class VerifyButton(
+    discord.ui.DynamicItem[discord.ui.Button],
+    template=r"verify_(?P<action>accept|reject)_(?P<uid>[0-9]+)",
+):
+    def __init__(self, action: str, member_id: int, disabled: bool = False):
+        if action == "accept":
+            label, style = "✅ Verify", discord.ButtonStyle.success
+        else:
+            label, style = "❌ Reject", discord.ButtonStyle.danger
+        super().__init__(
+            discord.ui.Button(
+                label=label,
+                style=style,
+                custom_id=f"verify_{action}_{member_id}",
+                disabled=disabled,
             )
+        )
+        self.action = action
+        self.member_id = member_id
 
-        embed = interaction.message.embeds[0]
-        embed.color = discord.Color.green()
-        embed.add_field(name="Verified", value=f"✅ {interaction.user.mention}", inline=False)
-        embed.set_footer(text="Verified ✅")
-        for item in self.children:
-            item.disabled = True
-        await interaction.followup.edit_message(interaction.message.id, embed=embed, view=self)
+    @classmethod
+    async def from_custom_id(cls, interaction: discord.Interaction, item: discord.ui.Button, match, /):
+        return cls(match["action"], int(match["uid"]))
 
-        if WELCOME_CHANNEL_ID:
-            welcome_channel = guild.get_channel(WELCOME_CHANNEL_ID)
-            if welcome_channel:
-                await welcome_channel.send(f"🎉 Welcome {member.mention}, you're verified — glad to have you in the server!")
-
-    @discord.ui.button(label="❌ Reject", style=discord.ButtonStyle.danger)
-    async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def callback(self, interaction: discord.Interaction):
         # Defer first to prevent timeout
         await interaction.response.defer()
 
-        embed = interaction.message.embeds[0]
-        embed.color = discord.Color.red()
-        embed.add_field(name="Rejected", value=f"❌ {interaction.user.mention}", inline=False)
-        embed.set_footer(text="Rejected ❌")
-        for item in self.children:
-            item.disabled = True
-        await interaction.followup.edit_message(interaction.message.id, embed=embed, view=self)
+        if _already_done(interaction.message, ("Verified ✅", "Rejected ❌")):
+            return await interaction.followup.send("This request was already handled.", ephemeral=True)
+
+        embed = interaction.message.embeds[0].copy()
+
+        if self.action == "accept":
+            guild = interaction.guild
+            member = guild.get_member(self.member_id)
+            if member is None:
+                try:
+                    member = await guild.fetch_member(self.member_id)
+                except discord.HTTPException:
+                    member = None
+            if member is None:
+                return await interaction.followup.send(
+                    "That member isn't in the server anymore (they may have left).", ephemeral=True
+                )
+
+            unverified_role = guild.get_role(UNVERIFIED_ROLE_ID)
+            verified_role = guild.get_role(VERIFIED_ROLE_ID)
+
+            try:
+                if unverified_role and unverified_role in member.roles:
+                    await member.remove_roles(unverified_role, reason=f"Verified by {interaction.user}")
+                if verified_role:
+                    await member.add_roles(verified_role, reason=f"Verified by {interaction.user}")
+                for rid in EXTRA_ROLES_ON_VERIFY:
+                    r = guild.get_role(rid)
+                    if r:
+                        await member.add_roles(r, reason="Extra role after verification")
+            except discord.Forbidden:
+                return await interaction.followup.send(
+                    "The bot doesn't have enough permission to change roles (make sure the bot's role is above the roles it manages).",
+                    ephemeral=True,
+                )
+            except discord.HTTPException as e:
+                print(f"❌ Failed to change roles for {member}: {e}")
+                return await interaction.followup.send("Something went wrong while changing roles. Try again.", ephemeral=True)
+
+            embed.color = discord.Color.green()
+            embed.add_field(name="Verified", value=f"✅ {interaction.user.mention}", inline=False)
+            embed.set_footer(text="Verified ✅")
+            member_inviters.pop(self.member_id, None)
+            await interaction.edit_original_response(embed=embed, view=verify_view(self.member_id, disabled=True))
+
+            if WELCOME_CHANNEL_ID:
+                welcome_channel = guild.get_channel(WELCOME_CHANNEL_ID)
+                if welcome_channel:
+                    try:
+                        await welcome_channel.send(
+                            f"🎉 Welcome {member.mention}, you're verified — glad to have you in the server!"
+                        )
+                    except discord.HTTPException as e:
+                        print(f"⚠️ Couldn't send welcome message: {e}")
+        else:
+            embed.color = discord.Color.red()
+            embed.add_field(name="Rejected", value=f"❌ {interaction.user.mention}", inline=False)
+            embed.set_footer(text="Rejected ❌")
+            await interaction.edit_original_response(embed=embed, view=verify_view(self.member_id, disabled=True))
+
+
+def verify_view(member_id: int, disabled: bool = False) -> discord.ui.View:
+    view = discord.ui.View(timeout=None)
+    view.add_item(VerifyButton("accept", member_id, disabled))
+    view.add_item(VerifyButton("reject", member_id, disabled))
+    return view
 
 
 class ResolveNoteModal(discord.ui.Modal, title="Resolve Help Request"):
@@ -255,50 +308,82 @@ class ResolveNoteModal(discord.ui.Modal, title="Resolve Help Request"):
         max_length=500,
     )
 
-    def __init__(self, view: "HelpRequestView"):
+    def __init__(self, member_id: int):
         super().__init__()
-        self.view = view
+        self.member_id = member_id
 
     async def on_submit(self, interaction: discord.Interaction):
-        embed = interaction.message.embeds[0]
+        if interaction.message is None or not interaction.message.embeds:
+            return await interaction.response.send_message("Couldn't find the alert message.", ephemeral=True)
+        if _already_done(interaction.message, ("Resolved ✅",)):
+            return await interaction.response.send_message("This request was already resolved.", ephemeral=True)
+
+        embed = interaction.message.embeds[0].copy()
         embed.color = discord.Color.green()
         if self.note.value:
             embed.add_field(name="What happened", value=self.note.value, inline=False)
         embed.add_field(name="Resolved", value=f"✅ {interaction.user.mention}", inline=False)
         embed.set_footer(text="Resolved ✅")
-        for item in self.view.children:
-            item.disabled = True
-        await interaction.response.edit_message(embed=embed, view=self.view)
+        await interaction.response.edit_message(embed=embed, view=help_view(self.member_id, disabled=True))
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        print(f"❌ Resolve modal error: {error}")
+        if not interaction.response.is_done():
+            await interaction.response.send_message("Something went wrong. Please try again.", ephemeral=True)
 
 
-class HelpRequestView(discord.ui.View):
-    """Single 'Mark as Resolved' button for help alerts. Opens a popup asking what the problem was. Doesn't touch any roles."""
+class HelpResolveButton(
+    discord.ui.DynamicItem[discord.ui.Button],
+    template=r"help_resolved_(?P<uid>[0-9]+)",
+):
+    """'Mark as Resolved' button for help alerts. Opens a popup asking what the problem was.
+    Doesn't touch any roles."""
 
-    def __init__(self, member_id: int):
-        super().__init__(timeout=None)
+    def __init__(self, member_id: int, disabled: bool = False):
+        super().__init__(
+            discord.ui.Button(
+                label="✅ Mark as Resolved",
+                style=discord.ButtonStyle.success,
+                custom_id=f"help_resolved_{member_id}",
+                disabled=disabled,
+            )
+        )
         self.member_id = member_id
-        self.children[0].custom_id = f"help_resolved_{member_id}"
 
-    @discord.ui.button(label="✅ Mark as Resolved", style=discord.ButtonStyle.success)
-    async def resolve(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(ResolveNoteModal(self))
+    @classmethod
+    async def from_custom_id(cls, interaction: discord.Interaction, item: discord.ui.Button, match, /):
+        return cls(int(match["uid"]))
+
+    async def callback(self, interaction: discord.Interaction):
+        if _already_done(interaction.message, ("Resolved ✅",)):
+            return await interaction.response.send_message("This request was already resolved.", ephemeral=True)
+        await interaction.response.send_modal(ResolveNoteModal(self.member_id))
+
+
+def help_view(member_id: int, disabled: bool = False) -> discord.ui.View:
+    view = discord.ui.View(timeout=None)
+    view.add_item(HelpResolveButton(member_id, disabled))
+    return view
 
 
 class IssueReportView(discord.ui.View):
     """Simple 'Mark as Seen' button for issue reports, so staff can tell what's already
     been looked at without anyone having to delete or reply to the embed."""
 
-    def __init__(self):
+    def __init__(self, seen: bool = False):
         super().__init__(timeout=None)
+        if seen:
+            self.mark_seen.label = "✅ Seen"
+            self.mark_seen.disabled = True
 
     @discord.ui.button(label="✅ Mark as Seen", style=discord.ButtonStyle.success, custom_id="issue_report_seen")
     async def mark_seen(self, interaction: discord.Interaction, button: discord.ui.Button):
-        embed = interaction.message.embeds[0]
+        embed = interaction.message.embeds[0].copy()
+        if any(f.name == "Seen by" for f in embed.fields):
+            return await interaction.response.send_message("Already marked as seen.", ephemeral=True)
         embed.color = discord.Color.green()
         embed.add_field(name="Seen by", value=interaction.user.mention, inline=False)
-        button.label = "✅ Seen"
-        button.disabled = True
-        await interaction.response.edit_message(embed=embed, view=self)
+        await interaction.response.edit_message(embed=embed, view=IssueReportView(seen=True))
 
 
 class DescribeIssueModal(discord.ui.Modal, title="Describe Your Issue"):
@@ -350,15 +435,37 @@ class DescribeIssueModal(discord.ui.Modal, title="Describe Your Issue"):
             ephemeral=True,
         )
 
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        print(f"❌ Describe-issue modal error: {error}")
+        if not interaction.response.is_done():
+            await interaction.response.send_message("Something went wrong. Please try again.", ephemeral=True)
 
-class MemberHelpPanelView(discord.ui.View):
-    """Panel shown to the member themselves while they wait for staff."""
 
-    def __init__(self, member_id: int):
-        super().__init__(timeout=None)
+class MemberPanelButton(
+    discord.ui.DynamicItem[discord.ui.Button],
+    template=r"member_(?P<action>describe|cancel)_(?P<uid>[0-9]+)",
+):
+    """Buttons on the panel shown to the member themselves while they wait for staff."""
+
+    def __init__(self, action: str, member_id: int, disabled: bool = False):
+        if action == "describe":
+            label, style = "📝 Describe Issue", discord.ButtonStyle.primary
+        else:
+            label, style = "❌ Cancel Request", discord.ButtonStyle.secondary
+        super().__init__(
+            discord.ui.Button(
+                label=label,
+                style=style,
+                custom_id=f"member_{action}_{member_id}",
+                disabled=disabled,
+            )
+        )
+        self.action = action
         self.member_id = member_id
-        self.children[0].custom_id = f"member_describe_{member_id}"
-        self.children[1].custom_id = f"member_cancel_{member_id}"
+
+    @classmethod
+    async def from_custom_id(cls, interaction: discord.Interaction, item: discord.ui.Button, match, /):
+        return cls(match["action"], int(match["uid"]))
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.member_id:
@@ -366,73 +473,96 @@ class MemberHelpPanelView(discord.ui.View):
             return False
         return True
 
-    @discord.ui.button(label="📝 Describe Issue", style=discord.ButtonStyle.primary)
-    async def describe(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(DescribeIssueModal(self.member_id))
+    async def callback(self, interaction: discord.Interaction):
+        if self.action == "describe":
+            await interaction.response.send_modal(DescribeIssueModal(self.member_id))
+            return
 
-    @discord.ui.button(label="❌ Cancel Request", style=discord.ButtonStyle.secondary)
-    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
-        embed = interaction.message.embeds[0]
+        embed = interaction.message.embeds[0].copy()
         embed.color = discord.Color.greyple()
         embed.set_field_at(0, name="Status", value="⚪ Cancelled by member", inline=True)
-        for item in self.children:
-            item.disabled = True
-        await interaction.response.edit_message(embed=embed, view=self)
+        await interaction.response.edit_message(embed=embed, view=panel_view(self.member_id, disabled=True))
         help_panels.pop(self.member_id, None)
+
+
+def panel_view(member_id: int, disabled: bool = False) -> discord.ui.View:
+    view = discord.ui.View(timeout=None)
+    view.add_item(MemberPanelButton("describe", member_id, disabled))
+    view.add_item(MemberPanelButton("cancel", member_id, disabled))
+    return view
+
+
+# ================================ Events ================================
+@bot.event
+async def setup_hook():
+    # Re-register every button so they keep working after a restart / redeploy.
+    bot.add_dynamic_items(VerifyButton, HelpResolveButton, MemberPanelButton)
+    bot.add_view(IssueReportView())
 
 
 @bot.event
 async def on_ready():
+    global _startup_sync_done
     print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
     guild = bot.get_guild(GUILD_ID)
-    if guild:
-        await cache_invites(guild)
-        # Sync REPORT VC nickname state in case people were already waiting when the bot
-        # started (or it crashed mid-rename last time).
-        for vc_id in REPORT_VC_IDS:
-            channel = guild.get_channel(vc_id)
-            if isinstance(channel, (discord.VoiceChannel, discord.StageChannel)):
-                for waiting_member in channel.members:
-                    await set_report_vc_alert(waiting_member, True)
-            elif channel is not None:
-                print(f"⚠️ REPORT_VC_IDS has {vc_id}, but that's a {type(channel).__name__}, not a voice channel — skipping it")
-
-        # Clean up leftover emoji nicknames (e.g. someone left while the bot was offline)
-        prefix = f"{REPORT_VC_EMOJI} "
-        waiting_ids = {
-            m.id
-            for vc_id in REPORT_VC_IDS
-            for m in getattr(guild.get_channel(vc_id), "members", [])
-        }
-        for m in guild.members:
-            if m.bot or m.id in waiting_ids or not m.nick or not m.nick.startswith(prefix):
-                continue
-            clean = m.nick[len(prefix):]
-            try:
-                await m.edit(
-                    nick=None if (not clean or clean == m.name) else clean,
-                    reason="Removing leftover report alert emoji",
-                )
-                print(f"🧹 Removed leftover emoji from {m}")
-            except (discord.Forbidden, discord.HTTPException):
-                pass
-    else:
+    if not guild:
         print(f"❌ Guild {GUILD_ID} not found!")
+        return
+
+    await cache_invites(guild)
+
+    if _startup_sync_done:
+        return  # reconnect - the one-time nickname sync below already ran
+    _startup_sync_done = True
+
+    # Sync REPORT VC nickname state in case people were already waiting when the bot
+    # started (or it crashed mid-rename last time).
+    for vc_id in REPORT_VC_IDS:
+        channel = guild.get_channel(vc_id)
+        if isinstance(channel, (discord.VoiceChannel, discord.StageChannel)):
+            for waiting_member in channel.members:
+                if not waiting_member.bot:
+                    await set_report_vc_alert(waiting_member, True)
+        elif channel is not None:
+            print(f"⚠️ REPORT_VC_IDS has {vc_id}, but that's a {type(channel).__name__}, not a voice channel — skipping it")
+        else:
+            print(f"⚠️ REPORT_VC_IDS has {vc_id}, but I can't find that channel")
+
+    # Clean up leftover emoji nicknames (e.g. someone left while the bot was offline)
+    prefix = f"{REPORT_VC_EMOJI} "
+    waiting_ids = {
+        m.id
+        for vc_id in REPORT_VC_IDS
+        for m in getattr(guild.get_channel(vc_id), "members", [])
+    }
+    for m in guild.members:
+        if m.bot or m.id in waiting_ids or not m.nick or not m.nick.startswith(prefix):
+            continue
+        clean = m.nick[len(prefix):]
+        try:
+            await m.edit(
+                nick=None if (not clean or clean == m.name) else clean,
+                reason="Removing leftover report alert emoji",
+            )
+            print(f"🧹 Removed leftover emoji from {m}")
+        except (discord.Forbidden, discord.HTTPException):
+            pass
 
 
 @bot.event
 async def on_invite_create(invite: discord.Invite):
     """Refresh invite cache when a new invite is created."""
-    if invite.guild.id == GUILD_ID:
+    if invite.guild and invite.guild.id == GUILD_ID:
         await cache_invites(invite.guild)
         print(f"📝 Invite created: {invite.code}")
 
 
 @bot.event
 async def on_invite_delete(invite: discord.Invite):
-    """Refresh invite cache when an invite is deleted."""
-    if invite.guild.id == GUILD_ID:
-        await cache_invites(invite.guild)
+    """Refresh invite cache when an invite is deleted.
+    (Careful: single-use invites vanish the moment they're used, so we must NOT
+    overwrite the cache here — on_member_join needs the old entry to spot them.)"""
+    if invite.guild and invite.guild.id == GUILD_ID:
         print(f"🗑️ Invite deleted: {invite.code}")
 
 
@@ -445,7 +575,7 @@ async def on_member_join(member: discord.Member):
 
     print(f"➕ {member} joined the server")
 
-    # Give bot a second to see the updated invites
+    # Give Discord a second to update the invite counters
     await asyncio.sleep(1)
 
     try:
@@ -458,7 +588,7 @@ async def on_member_join(member: discord.Member):
         # Case 1: an invite that still exists went up in use count
         for invite in current_invites:
             old_uses = old_cache.get(invite.code, {}).get("uses", 0)
-            if invite.uses > old_uses:
+            if (invite.uses or 0) > old_uses:
                 inviter = invite.inviter
                 print(f"👤 {member} was invited by {inviter} (invite {invite.code})")
                 break
@@ -485,9 +615,14 @@ async def on_member_join(member: discord.Member):
             member_inviters[member.id] = None
 
         # Update cache
-        await cache_invites(member.guild)
+        invite_cache[member.guild.id] = {
+            invite.code: {"uses": invite.uses or 0, "max_uses": invite.max_uses, "inviter": invite.inviter}
+            for invite in current_invites
+        }
     except discord.Forbidden:
-        print(f"⚠️ Bot doesn't have permission to view invites")
+        print("⚠️ Bot doesn't have permission to view invites")
+    except discord.HTTPException as e:
+        print(f"⚠️ Failed to read invites: {e}")
 
 
 async def send_verification_alert(member: discord.Member, voice_channel: discord.VoiceChannel):
@@ -508,6 +643,7 @@ async def send_verification_alert(member: discord.Member, voice_channel: discord
     # Build description with invite info if available
     inviter = member_inviters.get(member.id)
     invited_by_text = f"Invited by: {inviter.mention}" if inviter else "Invited by: Unknown (vanity URL or unknown invite)"
+    joined_text = discord.utils.format_dt(member.joined_at, "R") if member.joined_at else "Unknown"
 
     embed = discord.Embed(
         title="Member awaiting verification",
@@ -515,7 +651,7 @@ async def send_verification_alert(member: discord.Member, voice_channel: discord
             f"Member: {member.mention}\n"
             f"ID: `{member.id}`\n"
             f"Account created: {discord.utils.format_dt(member.created_at, 'R')}\n"
-            f"Joined server: {discord.utils.format_dt(member.joined_at, 'R')}\n"
+            f"Joined server: {joined_text}\n"
             f"{invited_by_text}\n"
             f"Joined voice channel: *{voice_channel.name}*"
         ),
@@ -524,14 +660,12 @@ async def send_verification_alert(member: discord.Member, voice_channel: discord
     embed.set_thumbnail(url=member.display_avatar.url)
     embed.set_footer(text="Click Verify to let this member in")
 
-    view = VerifyView(member.id)
-
     try:
         await send_with_retry(
             verification_channel,
             content="@everyone A member in the voice channel needs verification",
             embed=embed,
-            view=view,
+            view=verify_view(member.id),
             allowed_mentions=discord.AllowedMentions(everyone=True),
         )
         print(f"✅ Verification message sent for {member}")
@@ -566,14 +700,12 @@ async def send_help_alert(member: discord.Member, voice_channel: discord.VoiceCh
     )
     embed.timestamp = discord.utils.utcnow()
 
-    view = HelpRequestView(member.id)
-
     try:
         await send_with_retry(
             help_channel,
             content="@everyone A member in the voice channel needs help",
             embed=embed,
-            view=view,
+            view=help_view(member.id),
             allowed_mentions=discord.AllowedMentions(everyone=True),
         )
         print(f"✅ Help alert sent for {member}")
@@ -604,68 +736,32 @@ async def send_help_alert(member: discord.Member, voice_channel: discord.VoiceCh
     )
     member_embed.timestamp = discord.utils.utcnow()
 
-    member_view = MemberHelpPanelView(member.id)
-
     try:
         panel_message = await send_with_retry(
             member_panel_channel,
             content=member.mention,
             embed=member_embed,
-            view=member_view,
+            view=panel_view(member.id),
         )
         print(f"✅ Member panel sent for {member}")
-        help_panels[member.id] = {
-            "message": panel_message,
-            "view": member_view,
-            "described": False,
-            "closed": False,
-        }
-        bot.loop.create_task(auto_delete_help_panel(member.id, panel_message.id))
+        help_panels[member.id] = {"message": panel_message, "described": False}
     except Exception as e:
         print(f"❌ Failed to send member panel: {e}")
 
 
-async def auto_delete_help_panel(member_id: int, message_id: int):
-    """If the member never clicks 'Describe Issue' within 10 minutes, delete their
-    panel so stale requests don't pile up. Skipped if they already described their
-    issue, or the panel was already closed out (cancelled / resolved / they left)."""
-    await asyncio.sleep(600)  # 10 minutes
-
-    entry = help_panels.get(member_id)
-    if entry is None or entry["message"].id != message_id:
-        return  # already handled, or a newer panel replaced this one
-    if entry["described"] or entry["closed"]:
-        return
-
-    try:
-        await entry["message"].delete()
-        print(f"🗑️ Auto-deleted help panel for member {member_id} (no issue described within 10 min)")
-    except discord.NotFound:
-        pass
-    except discord.HTTPException as e:
-        print(f"⚠️ Failed to auto-delete help panel: {e}")
-
-    help_panels.pop(member_id, None)
-
-
 async def update_help_panel_status(member_id: int, status: str, color: discord.Color):
     """Edits a member's help panel Status field and disables its buttons, used when
-    they leave the voice channel or get moved elsewhere. Marks the panel closed so
-    the 10-minute auto-delete no longer fires."""
-    entry = help_panels.get(member_id)
-    if entry is None or entry["closed"]:
+    they leave the voice channel or get moved elsewhere. The panel itself is NOT deleted."""
+    entry = help_panels.pop(member_id, None)
+    if entry is None:
         return
-    entry["closed"] = True
 
     message = entry["message"]
-    view = entry["view"]
     try:
-        embed = message.embeds[0]
+        embed = message.embeds[0].copy()
         embed.color = color
         embed.set_field_at(0, name="Status", value=status, inline=True)
-        for item in view.children:
-            item.disabled = True
-        await message.edit(embed=embed, view=view)
+        await message.edit(embed=embed, view=panel_view(member_id, disabled=True))
     except discord.NotFound:
         pass
     except discord.HTTPException as e:
@@ -688,14 +784,13 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
     if joined_id == came_from_id:
         return  # no actual channel change (e.g. mute/deafen toggle)
 
-    # If this member has an open "waiting for help" panel, reflect what happened to
-    # them: fully disconnecting counts as giving up (red), while landing in a
-    # different channel counts as staff having moved them to help (green). Once
-    # either happens the panel is closed and no longer auto-deletes.
-    if member.id in help_panels:
+    # If this member has an open "waiting for help" panel and they just left the help
+    # channel, reflect what happened: fully disconnecting counts as giving up (red),
+    # while landing in a different channel counts as staff having moved them (green).
+    if member.id in help_panels and came_from_id in HELP_VC_CONFIG:
         if joined_id is None:
             await update_help_panel_status(member.id, "🔴 Left the queue", discord.Color.red())
-        elif came_from_id is not None:
+        else:
             await update_help_panel_status(member.id, "🟢 Resolved — moved by staff", discord.Color.green())
 
     if joined_id == WAITING_VC_ID:
