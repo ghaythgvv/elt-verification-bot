@@ -159,7 +159,10 @@ async def set_report_vc_alert(member: discord.Member, active: bool):
     waiting in a REPORT voice channel. Never sends any message - the renamed nickname
     itself is the alert."""
     base_nick = get_report_vc_base_nickname(member)
-    target_nick = f"{REPORT_VC_EMOJI} {base_nick or member.name}" if active else base_nick
+    if active:
+        target_nick = f"{REPORT_VC_EMOJI} {base_nick or member.name}"[:32]  # Discord nick limit is 32
+    else:
+        target_nick = base_nick
 
     if member.nick == target_nick:
         return  # already in the right state
@@ -393,6 +396,26 @@ async def on_ready():
                     await set_report_vc_alert(waiting_member, True)
             elif channel is not None:
                 print(f"⚠️ REPORT_VC_IDS has {vc_id}, but that's a {type(channel).__name__}, not a voice channel — skipping it")
+
+        # Clean up leftover emoji nicknames (e.g. someone left while the bot was offline)
+        prefix = f"{REPORT_VC_EMOJI} "
+        waiting_ids = {
+            m.id
+            for vc_id in REPORT_VC_IDS
+            for m in getattr(guild.get_channel(vc_id), "members", [])
+        }
+        for m in guild.members:
+            if m.bot or m.id in waiting_ids or not m.nick or not m.nick.startswith(prefix):
+                continue
+            clean = m.nick[len(prefix):]
+            try:
+                await m.edit(
+                    nick=None if (not clean or clean == m.name) else clean,
+                    reason="Removing leftover report alert emoji",
+                )
+                print(f"🧹 Removed leftover emoji from {m}")
+            except (discord.Forbidden, discord.HTTPException):
+                pass
     else:
         print(f"❌ Guild {GUILD_ID} not found!")
 
@@ -469,9 +492,10 @@ async def on_member_join(member: discord.Member):
 
 async def send_verification_alert(member: discord.Member, voice_channel: discord.VoiceChannel):
     """Posts the 'awaiting verification' embed with Verify/Reject buttons."""
-    # Skip if already verified
-    verified_role = member.guild.get_role(VERIFIED_ROLE_ID)
-    if verified_role and verified_role in member.roles:
+    # Only alert for members who have the Unverified role
+    unverified_role = member.guild.get_role(UNVERIFIED_ROLE_ID)
+    if unverified_role is None or unverified_role not in member.roles:
+        print(f"⏭️ Skipped {member}: no Unverified role")
         return
 
     verification_channel = member.guild.get_channel(VERIFICATION_CHANNEL_ID)
