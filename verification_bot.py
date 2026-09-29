@@ -68,9 +68,9 @@ HELP_VC_CONFIG = {
     1517941411151085691: {"emoji": "🔔", "send_member_panel": True},
 }
 
-# The "REPORT" voice channels: no message is ever sent for these. Instead, while a member
-# is waiting in one of these channels, the bot prefixes THEIR OWN nickname with
-# REPORT_VC_EMOJI. As soon as they leave the channel, their nickname is restored.
+# Verification + REPORT voice channels: while a member is waiting in one of these,
+# the bot prefixes THEIR OWN nickname with REPORT_VC_EMOJI. As soon as they leave
+# those channels, their nickname is restored. REPORT channels still send no message.
 REPORT_VC_EMOJI = "⛔"
 REPORT_VC_IDS = {
     1552746347113746453,
@@ -145,29 +145,43 @@ async def send_with_retry(channel, **kwargs):
 
 
 def get_report_vc_base_nickname(member: discord.Member) -> str | None:
-    """Returns member.nick with the REPORT_VC_EMOJI prefix stripped off (if present),
-    caching the result so later calls always restore the true original nickname even
-    after we've already prefixed it. None means "member had no nickname set"."""
+    """Return the nickname that should be restored after leaving an alert VC."""
     if member.id not in report_vc_base_nicknames:
         nick = member.nick
         prefix = f"{REPORT_VC_EMOJI} "
+
+        # If the bot already added the emoji before a restart, strip only our prefix.
         if nick and nick.startswith(prefix):
             nick = nick[len(prefix):]
-            # We used the username as a stand-in when they had no nickname, so after a
-            # restart "⛔ username" should go back to "no nickname", not to "username".
+
+            # If what remains is the username, this was probably the bot's
+            # fallback for a member who originally had no server nickname.
             if not nick or nick == member.name:
                 nick = None
+
         report_vc_base_nicknames[member.id] = nick
+
     return report_vc_base_nicknames[member.id]
 
 
 async def set_report_vc_alert(member: discord.Member, active: bool):
-    """Prefixes/un-prefixes a member's own nickname with REPORT_VC_EMOJI while they're
-    waiting in a REPORT voice channel. Never sends any message - the renamed nickname
-    itself is the alert."""
+    """Add/remove the alert emoji from the member's nickname.
+
+    This is used by BOTH the verification VC and report VCs.
+    The original nickname is cached so it can be restored when they leave.
+    """
     base_nick = get_report_vc_base_nickname(member)
+
     if active:
-        target_nick = f"{REPORT_VC_EMOJI} {base_nick or member.name}"[:32]  # Discord nick limit is 32
+        visible_name = base_nick or member.name
+        prefix = f"{REPORT_VC_EMOJI} "
+
+        # Prevent duplicate emoji prefixes.
+        if visible_name.startswith(prefix):
+            visible_name = visible_name[len(prefix):]
+
+        # Discord server nicknames are limited to 32 characters.
+        target_nick = f"{prefix}{visible_name}"[:32]
     else:
         target_nick = base_nick
 
@@ -769,43 +783,83 @@ async def update_help_panel_status(member_id: int, status: str, color: discord.C
 
 
 @bot.event
-async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
-    """Routes to the verification alert, the help alert, or the silent REPORT-VC emoji
-    toggle depending on which waiting channel was joined/left."""
-    if member.guild.id != GUILD_ID:
+async def on_voice_state_update(
+    member: discord.Member,
+    before: discord.VoiceState,
+    after: discord.VoiceState,
+):
+    """
+    Handles all waiting voice channels.
+
+    - Verification VC:
+        * adds REPORT_VC_EMOJI to the member's nickname
+        * sends the verification alert
+    - Help VC:
+        * sends the help alert / member panel
+    - Report VCs:
+        * adds REPORT_VC_EMOJI to the member's nickname
+    - When a member leaves verification/report VCs:
+        * removes the emoji and restores their previous nickname
+
+    Moving directly between verification/report VCs keeps the emoji.
+    """
+    if member.guild.id != GUILD_ID or member.bot:
         return
 
-    if member.bot:
-        return  # bots (including this one) never trigger verification, help, or report alerts
+    before_id = before.channel.id if before.channel else None
+    after_id = after.channel.id if after.channel else None
 
-    joined_id = after.channel.id if after.channel else None
-    came_from_id = before.channel.id if before.channel else None
+    # Ignore mute/deafen/stream/camera changes in the same VC.
+    if before_id == after_id:
+        return
 
-    if joined_id == came_from_id:
-        return  # no actual channel change (e.g. mute/deafen toggle)
+    # Help panel cleanup when a member leaves a help VC.
+    if member.id in help_panels and before_id in HELP_VC_CONFIG:
+        if after_id is None:
+            await update_help_panel_status(
+                member.id,
+                "🔴 Left the queue",
+                discord.Color.red(),
+            )
+        elif after_id != before_id:
+            await update_help_panel_status(
+                member.id,
+                "🟢 Resolved — moved by staff",
+                discord.Color.green(),
+            )
 
-    # If this member has an open "waiting for help" panel and they just left the help
-    # channel, reflect what happened: fully disconnecting counts as giving up (red),
-    # while landing in a different channel counts as staff having moved them (green).
-    if member.id in help_panels and came_from_id in HELP_VC_CONFIG:
-        if joined_id is None:
-            await update_help_panel_status(member.id, "🔴 Left the queue", discord.Color.red())
-        else:
-            await update_help_panel_status(member.id, "🟢 Resolved — moved by staff", discord.Color.green())
+    # These are the channels that should show the alert emoji on the
+    # MEMBER'S OWN NICKNAME.
+    emoji_channels = {WAITING_VC_ID, *REPORT_VC_IDS}
 
-    if joined_id == WAITING_VC_ID:
-        await send_verification_alert(member, after.channel)
-    elif joined_id in HELP_VC_CONFIG:
-        await send_help_alert(member, after.channel, HELP_VC_CONFIG[joined_id])
-    elif joined_id in REPORT_VC_IDS and isinstance(after.channel, (discord.VoiceChannel, discord.StageChannel)):
+    # Joined verification VC.
+    if after_id == WAITING_VC_ID:
+        # Everyone gets the emoji, regardless of whether they are currently
+        # unverified. The verification alert itself still checks the role.
         await set_report_vc_alert(member, True)
 
-    # Only clear the REPORT-VC emoji if they *didn't* move straight into another REPORT
-    # channel — otherwise this would immediately undo the "add emoji" call right above,
-    # leaving the member with no emoji even though they're still waiting in a REPORT VC.
+        if isinstance(after.channel, (discord.VoiceChannel, discord.StageChannel)):
+            await send_verification_alert(member, after.channel)
+
+    # Joined a help VC.
+    elif after_id in HELP_VC_CONFIG:
+        if isinstance(after.channel, (discord.VoiceChannel, discord.StageChannel)):
+            await send_help_alert(
+                member,
+                after.channel,
+                HELP_VC_CONFIG[after_id],
+            )
+
+    # Joined a report VC.
+    elif after_id in REPORT_VC_IDS:
+        if isinstance(after.channel, (discord.VoiceChannel, discord.StageChannel)):
+            await set_report_vc_alert(member, True)
+
+    # If the member left verification/report VC entirely, remove the emoji.
+    # Moving between verification/report channels keeps it.
     if (
-        came_from_id in REPORT_VC_IDS
-        and joined_id not in REPORT_VC_IDS
+        before_id in emoji_channels
+        and after_id not in emoji_channels
         and isinstance(before.channel, (discord.VoiceChannel, discord.StageChannel))
     ):
         await set_report_vc_alert(member, False)
