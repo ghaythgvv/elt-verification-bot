@@ -11,15 +11,22 @@ How it works:
 2) When a member joins one of the "Waiting for Help" voice channels:
    - The member's own server nickname gets the ⏳ prefix while they wait there
      (and it's removed when they leave).
-   - The bot posts a simpler embed (no invited-by / joined-server info) pinging @everyone,
-     with a "Mark as Resolved" button. No roles are changed for this flow.
+   - MODERATOR PANEL: the bot posts an alert pinging @everyone with 3 buttons:
+         🙋 Claim              -> the member instantly sees WHO is handling them
+         ✅ Mark as Resolved   -> one click, done (member panel updates by itself)
+         📝 Resolve + Note     -> same, but lets you write what the problem was
+     The voice channel name is a clickable link, so a MODERATOR can jump straight in.
+   - MEMBER PANEL: the member gets a clean panel with a live Status
+         🟡 Waiting for a MODERATOR  ->  🔵 <moderator> is handling your request
+         ->  🟢 Resolved  (or 🔴 left the queue / ⚪ cancelled)
+     plus "Describe Issue" and "Cancel Request" buttons.
+   - When the member presses "Describe Issue", their text is added to the MODERATOR alert
+     (so moderators see everything in ONE place) and also posted to ISSUE_REPORTS_CHANNEL_ID.
+   - If the member leaves, cancels, or gets moved, the MODERATOR alert closes by itself.
+   - The member-facing panel is never auto-deleted — it stays up until a MODERATOR
+     removes it manually.
    - Each waiting-for-help channel has its own emoji shown in the alert title, and can
-     independently turn the member-facing "Describe Issue" report form on or off
-     (see HELP_VC_CONFIG below).
-   - The member-facing panel is never auto-deleted (not on resolve, not on leaving the VC) —
-     it stays up until a staff member removes it manually.
-   - When the member submits "Describe Issue", it's posted as an embed to
-     ISSUE_REPORTS_CHANNEL_ID, and the member gets a private (ephemeral) confirmation.
+     independently turn the member-facing panel on or off (see HELP_VC_CONFIG below).
 3) When a member joins one of the "REPORT" voice channels:
    - No message is sent anywhere. Instead the bot prefixes that member's own server
      nickname with ⛔ while they're waiting in the channel, and removes
@@ -64,15 +71,15 @@ VERIFICATION_CHANNEL_ID = 1542531178526146670  # channel where verify requests g
 WELCOME_CHANNEL_ID = None                        # welcome channel (optional - leave as None if you don't want a welcome message)
 WAITING_VC_ID = 1513904254535073883              # the "Waiting for Move" voice channel
 
-HELP_ALERT_CHANNEL_ID = 1551163762084683866  # channel where the staff alert gets posted (the Waiting for Help voice channel's own chat)
+HELP_ALERT_CHANNEL_ID = 1551163762084683866  # channel where the MODERATOR alert gets posted (the Waiting for Help voice channel's own chat)
 MEMBER_HELP_PANEL_CHANNEL_ID = 1553786062579699722  # channel where the member-facing panel gets posted
 ISSUE_REPORTS_CHANNEL_ID = 1553196616146493460  # channel where "Describe Issue" submissions get posted
 
-# Per-VC settings for the "waiting for help" flow (staff alert + optional member panel):
-#   - emoji: shown in the staff alert embed title, so you can tell at a glance which
+# Per-VC settings for the "waiting for help" flow (MODERATOR alert + optional member panel):
+#   - emoji: shown in the MODERATOR alert title, so you can tell at a glance which
 #     channel triggered it
-#   - send_member_panel: whether the member-facing "Describe Issue" report form panel
-#     gets sent for this channel (False = staff alert only, no report form)
+#   - send_member_panel: whether the member-facing panel (Describe Issue / Cancel)
+#     gets sent for this channel (False = MODERATOR alert only, no member panel)
 HELP_VC_CONFIG = {
     1517941411151085691: {"emoji": "🔔", "send_member_panel": True},
 }
@@ -129,12 +136,18 @@ report_vc_base_nicknames = {}
 # "remove emoji" edits run at the same time and leave the emoji stuck on the name.
 _nick_locks: dict[int, asyncio.Lock] = {}
 
-# help_panels[member_id] = {"message": discord.Message, "described": bool}
-# Tracks the member-facing "waiting for help" panel so we can update its Status field
-# when the member leaves/gets moved out of the help channel.
+# help_panels[member_id] = {
+#     "message": member-facing panel message (or None if the panel is turned off),
+#     "alert": the MODERATOR alert message,
+#     "described": bool, "claimed": bool,
+# }
+# Lets the two panels stay in sync with each other (claim / resolve / leave / cancel).
 help_panels = {}
 
 _startup_sync_done = False  # on_ready can fire many times (reconnects) - only sync nicknames once
+
+# Footers that mean "this MODERATOR alert is finished" (buttons are disabled).
+ALERT_DONE_FOOTERS = ("Resolved ✅", "Member left ❌", "Cancelled ⚪")
 
 
 async def cache_invites(guild: discord.Guild):
@@ -167,6 +180,22 @@ async def send_with_retry(channel, **kwargs):
                 await asyncio.sleep(delay)
             else:
                 raise
+
+
+def set_field(embed: discord.Embed, name: str, value: str, inline: bool = False):
+    """Update a field by name if it exists, otherwise add it (never creates duplicates)."""
+    for i, f in enumerate(embed.fields):
+        if f.name == name:
+            embed.set_field_at(i, name=name, value=value, inline=inline)
+            return
+    embed.add_field(name=name, value=value, inline=inline)
+
+
+def get_field(embed: discord.Embed, name: str) -> str | None:
+    for f in embed.fields:
+        if f.name == name:
+            return f.value
+    return None
 
 
 # ====================== Nickname emoji (⏳ waiting / ⛔ report) ======================
@@ -431,8 +460,38 @@ def verify_view(member_id: int, disabled: bool = False) -> discord.ui.View:
     return view
 
 
+# ====================== MODERATOR panel (help alerts) ======================
+def _is_claimed(embed: discord.Embed) -> bool:
+    return get_field(embed, "Claimed by") is not None
+
+
+async def resolve_alert(interaction: discord.Interaction, member_id: int, note: str | None = None):
+    """Marks a MODERATOR alert as resolved (used by both the one-click button and the note popup)
+    and updates the member's panel to 'Resolved'."""
+    message = interaction.message
+    if message is None or not message.embeds:
+        return await interaction.response.send_message("Couldn't find the alert message.", ephemeral=True)
+    if _already_done(message, ALERT_DONE_FOOTERS):
+        return await interaction.response.send_message("This request was already closed.", ephemeral=True)
+
+    embed = message.embeds[0].copy()
+    embed.color = discord.Color.green()
+    if note:
+        set_field(embed, "What happened", note, inline=False)
+    set_field(embed, "Resolved by", f"✅ {interaction.user.mention}", inline=False)
+    embed.set_footer(text="Resolved ✅")
+    await interaction.response.edit_message(embed=embed, view=help_view(member_id, disabled=True))
+
+    # Tell the member (their panel gets a final status and its buttons are disabled).
+    await close_help_request(
+        member_id,
+        f"🟢 Resolved by {interaction.user.mention}",
+        discord.Color.green(),
+    )
+
+
 class ResolveNoteModal(discord.ui.Modal, title="Resolve Help Request"):
-    """Popup asking what the problem was, shown when staff click Mark as Resolved."""
+    """Popup asking what the problem was, shown when a MODERATOR clicks Resolve + Note."""
 
     note = discord.ui.TextInput(
         label="What was the problem? (optional)",
@@ -447,18 +506,7 @@ class ResolveNoteModal(discord.ui.Modal, title="Resolve Help Request"):
         self.member_id = member_id
 
     async def on_submit(self, interaction: discord.Interaction):
-        if interaction.message is None or not interaction.message.embeds:
-            return await interaction.response.send_message("Couldn't find the alert message.", ephemeral=True)
-        if _already_done(interaction.message, ("Resolved ✅",)):
-            return await interaction.response.send_message("This request was already resolved.", ephemeral=True)
-
-        embed = interaction.message.embeds[0].copy()
-        embed.color = discord.Color.green()
-        if self.note.value:
-            embed.add_field(name="What happened", value=self.note.value, inline=False)
-        embed.add_field(name="Resolved", value=f"✅ {interaction.user.mention}", inline=False)
-        embed.set_footer(text="Resolved ✅")
-        await interaction.response.edit_message(embed=embed, view=help_view(self.member_id, disabled=True))
+        await resolve_alert(interaction, self.member_id, self.note.value or None)
 
     async def on_error(self, interaction: discord.Interaction, error: Exception):
         print(f"❌ Resolve modal error: {error}")
@@ -466,42 +514,82 @@ class ResolveNoteModal(discord.ui.Modal, title="Resolve Help Request"):
             await interaction.response.send_message("Something went wrong. Please try again.", ephemeral=True)
 
 
-class HelpResolveButton(
+class HelpButton(
     discord.ui.DynamicItem[discord.ui.Button],
-    template=r"help_resolved_(?P<uid>[0-9]+)",
+    template=r"help_(?P<action>claim|resolved|note)_(?P<uid>[0-9]+)",
 ):
-    """'Mark as Resolved' button for help alerts. Opens a popup asking what the problem was.
-    Doesn't touch any roles."""
+    """Buttons on the MODERATOR alert:
+        claim    -> "I'm on it" (the member sees who is handling them)
+        resolved -> close it in one click
+        note     -> close it, with a popup for what the problem was
+    None of these touch any roles."""
 
-    def __init__(self, member_id: int, disabled: bool = False):
+    def __init__(self, action: str, member_id: int, disabled: bool = False):
+        if action == "claim":
+            label, style = "🙋 Claim", discord.ButtonStyle.primary
+        elif action == "resolved":
+            label, style = "✅ Mark as Resolved", discord.ButtonStyle.success
+        else:
+            label, style = "📝 Resolve + Note", discord.ButtonStyle.secondary
         super().__init__(
             discord.ui.Button(
-                label="✅ Mark as Resolved",
-                style=discord.ButtonStyle.success,
-                custom_id=f"help_resolved_{member_id}",
+                label=label,
+                style=style,
+                custom_id=f"help_{action}_{member_id}",
                 disabled=disabled,
             )
         )
+        self.action = action
         self.member_id = member_id
 
     @classmethod
     async def from_custom_id(cls, interaction: discord.Interaction, item: discord.ui.Button, match, /):
-        return cls(int(match["uid"]))
+        return cls(match["action"], int(match["uid"]))
 
     async def callback(self, interaction: discord.Interaction):
-        if _already_done(interaction.message, ("Resolved ✅",)):
-            return await interaction.response.send_message("This request was already resolved.", ephemeral=True)
-        await interaction.response.send_modal(ResolveNoteModal(self.member_id))
+        message = interaction.message
+        if message is None or not message.embeds:
+            return await interaction.response.send_message("Couldn't find the alert message.", ephemeral=True)
+        if _already_done(message, ALERT_DONE_FOOTERS):
+            return await interaction.response.send_message("This request was already closed.", ephemeral=True)
+
+        if self.action == "resolved":
+            await resolve_alert(interaction, self.member_id)
+
+        elif self.action == "note":
+            await interaction.response.send_modal(ResolveNoteModal(self.member_id))
+
+        else:  # claim
+            embed = message.embeds[0].copy()
+            claimed_by = get_field(embed, "Claimed by")
+            if claimed_by:
+                return await interaction.response.send_message(
+                    f"Already claimed by {claimed_by}.", ephemeral=True
+                )
+            embed.color = discord.Color.blue()
+            set_field(embed, "Claimed by", interaction.user.mention, inline=True)
+            await interaction.response.edit_message(embed=embed, view=help_view(self.member_id, claimed=True))
+
+            entry = help_panels.get(self.member_id)
+            if entry is not None:
+                entry["claimed"] = True
+            await set_panel_status(
+                self.member_id,
+                f"🔵 {interaction.user.mention} is handling your request",
+                discord.Color.blue(),
+            )
 
 
-def help_view(member_id: int, disabled: bool = False) -> discord.ui.View:
+def help_view(member_id: int, claimed: bool = False, disabled: bool = False) -> discord.ui.View:
     view = discord.ui.View(timeout=None)
-    view.add_item(HelpResolveButton(member_id, disabled))
+    view.add_item(HelpButton("claim", member_id, disabled or claimed))
+    view.add_item(HelpButton("resolved", member_id, disabled))
+    view.add_item(HelpButton("note", member_id, disabled))
     return view
 
 
 class IssueReportView(discord.ui.View):
-    """Simple 'Mark as Seen' button for issue reports, so staff can tell what's already
+    """Simple 'Mark as Seen' button for issue reports, so MODERATORS can tell what's already
     been looked at without anyone having to delete or reply to the embed."""
 
     def __init__(self, seen: bool = False):
@@ -520,6 +608,65 @@ class IssueReportView(discord.ui.View):
         await interaction.response.edit_message(embed=embed, view=IssueReportView(seen=True))
 
 
+# ====================== MEMBER panel ======================
+async def set_panel_status(member_id: int, status: str, color: discord.Color):
+    """Changes the Status line on the member's panel but keeps its buttons working."""
+    entry = help_panels.get(member_id)
+    if entry is None or entry.get("message") is None:
+        return
+    try:
+        message = entry["message"]
+        embed = message.embeds[0].copy()
+        embed.color = color
+        embed.set_field_at(0, name="Status", value=status, inline=True)
+        await message.edit(embed=embed, view=panel_view(member_id))
+    except discord.NotFound:
+        pass
+    except discord.HTTPException as e:
+        print(f"⚠️ Failed to update member panel status: {e}")
+
+
+async def close_help_request(
+    member_id: int,
+    status: str,
+    color: discord.Color,
+    alert_footer: str | None = None,
+    skip_panel: bool = False,
+):
+    """Finishes a help request: gives the member panel a final status and disables its
+    buttons (the panel is NOT deleted). If `alert_footer` is given, the MODERATOR alert is
+    closed too (used when the member leaves, cancels, or gets moved)."""
+    entry = help_panels.pop(member_id, None)
+    if entry is None:
+        return
+
+    panel = entry.get("message")
+    if panel is not None and not skip_panel:
+        try:
+            embed = panel.embeds[0].copy()
+            embed.color = color
+            embed.set_field_at(0, name="Status", value=status, inline=True)
+            await panel.edit(embed=embed, view=panel_view(member_id, disabled=True))
+        except discord.NotFound:
+            pass
+        except discord.HTTPException as e:
+            print(f"⚠️ Failed to update member panel: {e}")
+
+    alert = entry.get("alert")
+    if alert_footer and alert is not None:
+        try:
+            fresh = await alert.channel.fetch_message(alert.id)  # get the latest version (claims, etc.)
+            if fresh.embeds and fresh.embeds[0].footer.text not in ALERT_DONE_FOOTERS:
+                embed = fresh.embeds[0].copy()
+                embed.color = color
+                embed.set_footer(text=alert_footer)
+                await fresh.edit(embed=embed, view=help_view(member_id, disabled=True))
+        except discord.NotFound:
+            pass
+        except discord.HTTPException as e:
+            print(f"⚠️ Failed to update MODERATOR alert: {e}")
+
+
 class DescribeIssueModal(discord.ui.Modal, title="Describe Your Issue"):
     issue = discord.ui.TextInput(
         label="What do you need help with?",
@@ -534,9 +681,39 @@ class DescribeIssueModal(discord.ui.Modal, title="Describe Your Issue"):
         self.member_id = member_id
 
     async def on_submit(self, interaction: discord.Interaction):
+        # Answer the member first so the popup never times out, then do the rest.
+        # Ephemeral - only the member who submitted it sees this confirmation.
+        await interaction.response.send_message(
+            "✅ Thanks — your issue has been sent to the MODERATORS. One will be with you shortly.",
+            ephemeral=True,
+        )
+
         member = interaction.guild.get_member(self.member_id) if interaction.guild else None
         reports_channel = interaction.guild.get_channel(ISSUE_REPORTS_CHANNEL_ID) if interaction.guild else None
 
+        # 1) Put the issue straight on the MODERATOR alert so everything is in one place.
+        entry = help_panels.get(self.member_id)
+        if entry is not None:
+            entry["described"] = True
+            alert = entry.get("alert")
+            if alert is not None:
+                try:
+                    fresh = await alert.channel.fetch_message(alert.id)
+                    if fresh.embeds and fresh.embeds[0].footer.text not in ALERT_DONE_FOOTERS:
+                        embed = fresh.embeds[0].copy()
+                        set_field(embed, "📝 Issue described", f">>> {self.issue.value}"[:1024], inline=False)
+                        await fresh.edit(embed=embed, view=help_view(self.member_id, claimed=_is_claimed(embed)))
+                except discord.HTTPException as e:
+                    print(f"⚠️ Couldn't add the issue to the MODERATOR alert: {e}")
+
+            if not entry.get("claimed"):
+                await set_panel_status(
+                    self.member_id,
+                    "📝 Issue sent — waiting for a MODERATOR",
+                    discord.Color.gold(),
+                )
+
+        # 2) Also post it to the issue reports channel (kept from before).
         if reports_channel is None:
             print("⚠️ Couldn't find the issue reports channel — check ISSUE_REPORTS_CHANNEL_ID")
         else:
@@ -559,16 +736,6 @@ class DescribeIssueModal(discord.ui.Modal, title="Describe Your Issue"):
             except Exception as e:
                 print(f"❌ Failed to send issue report: {e}")
 
-        panel_entry = help_panels.get(self.member_id)
-        if panel_entry is not None:
-            panel_entry["described"] = True
-
-        # Ephemeral - only the member who submitted it sees this confirmation.
-        await interaction.response.send_message(
-            "✅ Thanks — your issue has been sent to staff. Someone will be with you shortly.",
-            ephemeral=True,
-        )
-
     async def on_error(self, interaction: discord.Interaction, error: Exception):
         print(f"❌ Describe-issue modal error: {error}")
         if not interaction.response.is_done():
@@ -579,7 +746,7 @@ class MemberPanelButton(
     discord.ui.DynamicItem[discord.ui.Button],
     template=r"member_(?P<action>describe|cancel)_(?P<uid>[0-9]+)",
 ):
-    """Buttons on the panel shown to the member themselves while they wait for staff."""
+    """Buttons on the panel shown to the member themselves while they wait for a MODERATOR."""
 
     def __init__(self, action: str, member_id: int, disabled: bool = False):
         if action == "describe":
@@ -614,9 +781,17 @@ class MemberPanelButton(
 
         embed = interaction.message.embeds[0].copy()
         embed.color = discord.Color.greyple()
-        embed.set_field_at(0, name="Status", value="⚪ Cancelled by member", inline=True)
+        embed.set_field_at(0, name="Status", value="⚪ You cancelled this request", inline=True)
         await interaction.response.edit_message(embed=embed, view=panel_view(self.member_id, disabled=True))
-        help_panels.pop(self.member_id, None)
+
+        # Close the MODERATOR alert too, so nobody chases a request that was cancelled.
+        await close_help_request(
+            self.member_id,
+            "⚪ You cancelled this request",
+            discord.Color.greyple(),
+            alert_footer="Cancelled ⚪",
+            skip_panel=True,  # already edited above
+        )
 
 
 def panel_view(member_id: int, disabled: bool = False) -> discord.ui.View:
@@ -630,7 +805,7 @@ def panel_view(member_id: int, disabled: bool = False) -> discord.ui.View:
 @bot.event
 async def setup_hook():
     # Re-register every button so they keep working after a restart / redeploy.
-    bot.add_dynamic_items(VerifyButton, HelpResolveButton, MemberPanelButton)
+    bot.add_dynamic_items(VerifyButton, HelpButton, MemberPanelButton)
     bot.add_view(IssueReportView())
 
 
@@ -813,9 +988,8 @@ async def send_verification_alert(member: discord.Member, voice_channel: discord
 
 
 async def send_help_alert(member: discord.Member, voice_channel: discord.VoiceChannel, config: dict):
-    """Posts a 'needs help' embed - no invited-by/joined-server info, no role changes, just an
-    alert + resolve button. `config` is this VC's entry from HELP_VC_CONFIG (emoji + whether
-    the member-facing report form panel should be sent)."""
+    """Posts the MODERATOR panel (alert + Claim / Resolve buttons) and, if turned on for this
+    channel, the member panel. `config` is this VC's entry from HELP_VC_CONFIG."""
     help_channel = member.guild.get_channel(HELP_ALERT_CHANNEL_ID)
     if help_channel is None:
         print("⚠️ Couldn't find the help alert channel — check HELP_ALERT_CHANNEL_ID")
@@ -824,25 +998,28 @@ async def send_help_alert(member: discord.Member, voice_channel: discord.VoiceCh
     emoji = config.get("emoji", "🔔")
     print(f"📤 Sending help alert for {member} ({emoji})")
 
+    # ---------------- MODERATOR panel ----------------
     embed = discord.Embed(
         title=f"{emoji} Member needs help".strip(),
+        description=f"{member.mention} is waiting in {voice_channel.mention}",
         color=discord.Color.gold(),
     )
     embed.set_thumbnail(url=member.display_avatar.url)
     embed.add_field(name="Member", value=member.mention, inline=True)
     embed.add_field(name="ID", value=f"`{member.id}`", inline=True)
     embed.add_field(name="Account Created", value=discord.utils.format_dt(member.created_at, "R"), inline=True)
-    embed.add_field(name="Voice Channel", value=f"*{voice_channel.name}*", inline=False)
+    embed.add_field(name="Voice Channel", value=voice_channel.mention, inline=False)
     embed.set_footer(
-        text="ELITE LEADERS COMMUNITY • Click Mark as Resolved once this is handled",
+        text="ELITE LEADERS COMMUNITY • Claim it, then press Mark as Resolved when it's handled",
         icon_url=member.guild.icon.url if member.guild.icon else None,
     )
     embed.timestamp = discord.utils.utcnow()
 
+    alert_message = None
     try:
-        await send_with_retry(
+        alert_message = await send_with_retry(
             help_channel,
-            content="@everyone A member in the voice channel needs help",
+            content="@everyone A member needs a MODERATOR",
             embed=embed,
             view=help_view(member.id),
             allowed_mentions=discord.AllowedMentions(everyone=True),
@@ -851,10 +1028,19 @@ async def send_help_alert(member: discord.Member, voice_channel: discord.VoiceCh
     except Exception as e:
         print(f"❌ Failed to send help alert: {e}")
 
+    # Track this request so the two panels can update each other.
+    help_panels[member.id] = {
+        "message": None,
+        "alert": alert_message,
+        "described": False,
+        "claimed": False,
+    }
+
     if not config.get("send_member_panel", True):
-        # Report form turned off for this channel — staff alert only.
+        # Member panel turned off for this channel — MODERATOR alert only.
         return
 
+    # ---------------- MEMBER panel ----------------
     member_panel_channel = member.guild.get_channel(MEMBER_HELP_PANEL_CHANNEL_ID)
     if member_panel_channel is None:
         print("⚠️ Couldn't find the member panel channel — check MEMBER_HELP_PANEL_CHANNEL_ID")
@@ -862,13 +1048,17 @@ async def send_help_alert(member: discord.Member, voice_channel: discord.VoiceCh
 
     member_embed = discord.Embed(
         title="Support Request Received",
-        description="A staff member will be with you shortly. Thanks for your patience.",
-        color=discord.Color.blurple(),
+        description="A **MODERATOR** will be with you shortly. Thanks for your patience.",
+        color=discord.Color.gold(),
     )
     member_embed.set_thumbnail(url=member.display_avatar.url)
-    member_embed.add_field(name="Status", value="🟡 Waiting for staff", inline=True)
+    member_embed.add_field(name="Status", value="🟡 Waiting for a MODERATOR", inline=True)
     member_embed.add_field(name="Estimated Wait", value="~1-5 minutes", inline=True)
-    member_embed.add_field(name="Tip", value="Use the button below to describe your issue so staff can help faster", inline=False)
+    member_embed.add_field(
+        name="Tip",
+        value="Press **Describe Issue** so a MODERATOR knows what you need before they arrive.",
+        inline=False,
+    )
     member_embed.set_footer(
         text="ELITE LEADERS COMMUNITY • Support System",
         icon_url=member.guild.icon.url if member.guild.icon else None,
@@ -883,28 +1073,9 @@ async def send_help_alert(member: discord.Member, voice_channel: discord.VoiceCh
             view=panel_view(member.id),
         )
         print(f"✅ Member panel sent for {member}")
-        help_panels[member.id] = {"message": panel_message, "described": False}
+        help_panels[member.id]["message"] = panel_message
     except Exception as e:
         print(f"❌ Failed to send member panel: {e}")
-
-
-async def update_help_panel_status(member_id: int, status: str, color: discord.Color):
-    """Edits a member's help panel Status field and disables its buttons, used when
-    they leave the voice channel or get moved elsewhere. The panel itself is NOT deleted."""
-    entry = help_panels.pop(member_id, None)
-    if entry is None:
-        return
-
-    message = entry["message"]
-    try:
-        embed = message.embeds[0].copy()
-        embed.color = color
-        embed.set_field_at(0, name="Status", value=status, inline=True)
-        await message.edit(embed=embed, view=panel_view(member_id, disabled=True))
-    except discord.NotFound:
-        pass
-    except discord.HTTPException as e:
-        print(f"⚠️ Failed to update help panel status: {e}")
 
 
 @bot.event
@@ -922,7 +1093,7 @@ async def on_voice_state_update(
         * sends the verification alert
     - Help VC:
         * adds ⏳ to the member's nickname
-        * sends the help alert / member panel
+        * sends the MODERATOR alert / member panel
     - Report VCs:
         * adds ⛔ to the member's nickname
     - When a member leaves these VCs:
@@ -940,19 +1111,21 @@ async def on_voice_state_update(
     if before_id == after_id:
         return
 
-    # Help panel cleanup when a member leaves a help VC.
+    # Help panel cleanup when a member leaves a help VC. Both panels get closed.
     if member.id in help_panels and before_id in HELP_VC_CONFIG:
         if after_id is None:
-            await update_help_panel_status(
+            await close_help_request(
                 member.id,
-                "🔴 Left the queue",
+                "🔴 You left the queue",
                 discord.Color.red(),
+                alert_footer="Member left ❌",
             )
         elif after_id != before_id:
-            await update_help_panel_status(
+            await close_help_request(
                 member.id,
-                "🟢 Resolved — moved by staff",
+                "🟢 Resolved — a MODERATOR moved you",
                 discord.Color.green(),
+                alert_footer="Resolved ✅",
             )
 
     # Nickname emoji: start it right away as its own task so it runs at the same time as
