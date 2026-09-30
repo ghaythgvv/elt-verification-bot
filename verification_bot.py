@@ -88,6 +88,7 @@ REPORT_VC_IDS = {
     1517940974125318166,
 }
 REPORT_CATEGORY_ID = 1517941029221695760
+REPORT_CHANNEL_NAME = "⛔┃𝗥𝗘𝗣𝗢𝗥𝗧"  # name of the voice channel created for each report
 
 # {voice channel id: emoji to put on the member's nickname}
 ALERT_VC_EMOJIS = {
@@ -169,10 +170,71 @@ async def send_with_retry(channel, **kwargs):
 
 
 # ====================== Nickname emoji (⏳ waiting / ⛔ report) ======================
+def _is_report_room(channel) -> bool:
+    """True for the voice channels the bot creates for each report (not the trigger channel)."""
+    return (
+        channel is not None
+        and getattr(channel, "category_id", None) == REPORT_CATEGORY_ID
+        and channel.id not in REPORT_VC_IDS
+        and channel.name == REPORT_CHANNEL_NAME
+    )
+
+
 def _alert_emoji_for(member: discord.Member) -> str | None:
     """The emoji this member's nickname should carry RIGHT NOW (None = no emoji)."""
     channel = member.voice.channel if member.voice else None
-    return ALERT_VC_EMOJIS.get(channel.id) if channel else None
+    if channel is None:
+        return None
+    if _is_report_room(channel):
+        return REPORT_VC_EMOJI
+    return ALERT_VC_EMOJIS.get(channel.id)
+
+
+async def create_report_room(member: discord.Member):
+    """Creates a fresh report voice channel in the REPORT category and moves the member into it."""
+    guild = member.guild
+    category = guild.get_channel(REPORT_CATEGORY_ID)
+    if not isinstance(category, discord.CategoryChannel):
+        print("⚠️ Couldn't find the REPORT category — check REPORT_CATEGORY_ID")
+        return
+
+    try:
+        room = await guild.create_voice_channel(
+            REPORT_CHANNEL_NAME,
+            category=category,
+            overwrites=category.overwrites,
+            reason=f"Report room for {member}",
+        )
+    except discord.Forbidden:
+        print("⚠️ Can't create the report room — give the bot 'Manage Channels'")
+        return
+    except discord.HTTPException as e:
+        print(f"❌ Failed to create report room: {e}")
+        return
+
+    try:
+        await member.move_to(room, reason="Moved into their report room")
+        print(f"✅ Report room created for {member}")
+    except discord.Forbidden:
+        print("⚠️ Can't move the member — give the bot 'Move Members'")
+        await room.delete(reason="Couldn't move the member in")
+    except discord.HTTPException as e:
+        # Most likely the member already left the trigger channel.
+        print(f"⚠️ Couldn't move {member} into the report room: {e}")
+        await room.delete(reason="Member was no longer in voice")
+
+
+async def delete_if_empty_report_room(channel):
+    """Deletes an auto-created report room once no real person is left in it."""
+    if not _is_report_room(channel):
+        return
+    if any(not m.bot for m in channel.members):
+        return
+    try:
+        await channel.delete(reason="Report room is empty")
+        print(f"🗑️ Deleted empty report room {channel.id}")
+    except discord.HTTPException:
+        pass
 
 
 def _in_alert_vc(member: discord.Member) -> bool:
@@ -605,6 +667,19 @@ async def on_ready():
         else:
             print(f"⚠️ Can't find voice channel {vc_id}")
 
+    # Report rooms created before a restart: delete the empty ones, sync the occupied ones.
+    report_category = guild.get_channel(REPORT_CATEGORY_ID)
+    if isinstance(report_category, discord.CategoryChannel):
+        for vc in list(report_category.voice_channels):
+            if not _is_report_room(vc):
+                continue
+            if vc.members:
+                for room_member in vc.members:
+                    if not room_member.bot:
+                        await set_report_vc_alert(room_member)
+            else:
+                await delete_if_empty_report_room(vc)
+
     # Clean up leftover emoji nicknames (e.g. someone left while the bot was offline)
     for m in list(guild.members):
         if m.bot or _in_alert_vc(m):
@@ -884,11 +959,24 @@ async def on_voice_state_update(
     # the alerts below. set_report_vc_alert() looks at where the member is RIGHT NOW,
     # so it adds the emoji on join/move-in and removes it on leave/move-out.
     nick_task = None
-    if before_id in ALERT_VC_IDS or after_id in ALERT_VC_IDS:
+    if (
+        before_id in ALERT_VC_IDS
+        or after_id in ALERT_VC_IDS
+        or _is_report_room(before.channel)
+        or _is_report_room(after.channel)
+    ):
         nick_task = asyncio.create_task(set_report_vc_alert(member))
 
+    # Someone left an auto-created report room -> delete it if it's now empty.
+    if before.channel is not None and _is_report_room(before.channel):
+        asyncio.create_task(delete_if_empty_report_room(before.channel))
+
     try:
-        if after_id == WAITING_VC_ID:
+        if after_id in REPORT_VC_IDS:
+            # Moved into the trigger channel -> give them their own report room.
+            await create_report_room(member)
+
+        elif after_id == WAITING_VC_ID:
             if isinstance(after.channel, (discord.VoiceChannel, discord.StageChannel)):
                 await send_verification_alert(member, after.channel)
 
