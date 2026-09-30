@@ -93,6 +93,7 @@ WAITING_VC_EMOJI = "⏳"
 REPORT_VC_EMOJI = "⛔"
 REPORT_VC_IDS = {
     1517940974125318166,
+    1554981588880850964,  # new REPORT channel (members joining it get their own room + the ⛔ emoji)
 }
 REPORT_CATEGORY_ID = 1517941029221695760
 REPORT_CHANNEL_NAME = "⛔┃𝗥𝗘𝗣𝗢𝗥𝗧"  # name of the voice channel created for each report
@@ -135,6 +136,10 @@ report_vc_base_nicknames = {}
 # One lock per member so a quick join -> leave can't make the "add emoji" and
 # "remove emoji" edits run at the same time and leave the emoji stuck on the name.
 _nick_locks: dict[int, asyncio.Lock] = {}
+
+# Members the bot is NOT allowed to rename (server owner / higher role). The watchdog skips
+# them so it doesn't hit the API every few seconds; cleared when they change voice channel.
+_nick_failed: set[int] = set()
 
 # help_panels[member_id] = {
 #     "message": member-facing panel message (or None if the panel is turned off),
@@ -220,12 +225,19 @@ def get_field(embed: discord.Embed, name: str) -> str | None:
 
 
 # ====================== Nickname emoji (⏳ waiting / ⛔ report) ======================
+report_room_ids: set[int] = set()  # rooms created by the bot during this run (tracked by ID)
+
+
 def _is_report_room(channel) -> bool:
-    """True for the voice channels the bot creates for each report (not the trigger channel)."""
+    """True for the voice channels the bot creates for each report (not the trigger channel).
+    Rooms made since the bot started are recognised by ID; rooms left over from before a
+    restart are recognised by category + name."""
+    if channel is None or channel.id in REPORT_VC_IDS:
+        return False
+    if channel.id in report_room_ids:
+        return True
     return (
-        channel is not None
-        and getattr(channel, "category_id", None) == REPORT_CATEGORY_ID
-        and channel.id not in REPORT_VC_IDS
+        getattr(channel, "category_id", None) == REPORT_CATEGORY_ID
         and channel.name == REPORT_CHANNEL_NAME
     )
 
@@ -262,9 +274,13 @@ async def create_report_room(member: discord.Member):
         print(f"❌ Failed to create report room: {e}")
         return
 
+    report_room_ids.add(room.id)
     try:
         await member.move_to(room, reason="Moved into their report room")
         print(f"✅ Report room created for {member}")
+        # Put the ⛔ on right now - don't wait for the voice event (it can arrive late).
+        await asyncio.sleep(0.5)
+        await set_report_vc_alert(member)
     except discord.Forbidden:
         print("⚠️ Can't move the member — give the bot 'Move Members'")
         await room.delete(reason="Couldn't move the member in")
@@ -282,6 +298,7 @@ async def delete_if_empty_report_room(channel):
         return
     try:
         await channel.delete(reason="Report room is empty")
+        report_room_ids.discard(channel.id)
         print(f"🗑️ Deleted empty report room {channel.id}")
     except discord.HTTPException:
         pass
@@ -369,6 +386,7 @@ async def set_report_vc_alert(member: discord.Member):
             else:
                 reason = "give the bot 'Manage Nicknames' and move the bot's role ABOVE this member's top role"
             print(f"⚠️ Can't change {fresh}'s nickname — {reason}")
+            _nick_failed.add(fresh.id)
             if not active:
                 report_vc_base_nicknames.pop(fresh.id, None)
         except discord.HTTPException as e:
@@ -857,6 +875,33 @@ async def setup_hook():
     bot.add_view(IssueReportView())
 
 
+async def nickname_watchdog():
+    """Safety net so EVERY member in a waiting / help / report room always has their emoji.
+    Every 15 seconds it checks everyone sitting in those channels and fixes any nickname
+    that is missing its emoji (for example if a nickname edit was rate-limited or lost a race).
+    Members who already have the right emoji are skipped, so it costs nothing."""
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            guild = bot.get_guild(GUILD_ID)
+            if guild:
+                for vc in list(guild.channels):
+                    if not isinstance(vc, (discord.VoiceChannel, discord.StageChannel)):
+                        continue
+                    if vc.id not in ALERT_VC_IDS and not _is_report_room(vc):
+                        continue
+                    for m in list(vc.members):
+                        if m.bot or m.id in _nick_failed:
+                            continue
+                        want = _alert_emoji_for(m)
+                        if want and not (m.nick or "").startswith(f"{want} "):
+                            print(f"🔧 Watchdog: {m} is missing {want}, fixing")
+                            await set_report_vc_alert(m)
+        except Exception as e:
+            print(f"⚠️ Nickname watchdog error: {e}")
+        await asyncio.sleep(15)
+
+
 async def cleanup_finished_panels(guild: discord.Guild):
     """After a restart: finished member panels (all buttons disabled) that were waiting to be
     deleted get deleted now if they're older than 10 minutes, or re-scheduled for the time left."""
@@ -894,6 +939,9 @@ async def on_ready():
     if _startup_sync_done:
         return  # reconnect - the one-time nickname sync below already ran
     _startup_sync_done = True
+
+    watchdog_task = asyncio.create_task(nickname_watchdog())
+    _bg_tasks.add(watchdog_task)  # keep a reference so it is never garbage-collected
 
     # The emoji feature can't work without this permission - say so loudly at startup.
     if not guild.me.guild_permissions.manage_nicknames:
@@ -1193,6 +1241,8 @@ async def on_voice_state_update(
     # Ignore mute/deafen/stream/camera changes in the same VC.
     if before_id == after_id:
         return
+
+    _nick_failed.discard(member.id)  # new channel -> try renaming again
 
     # Help panel cleanup when a member leaves a help VC. Both panels get closed.
     if member.id in help_panels and before_id in HELP_VC_CONFIG:
