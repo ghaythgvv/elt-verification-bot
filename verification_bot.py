@@ -156,7 +156,11 @@ ALERT_DONE_FOOTERS = ("Resolved ✅", "Member left ❌", "Cancelled ⚪")
 
 # Finished member panels (resolved / left / cancelled) delete themselves after this long.
 PANEL_DELETE_AFTER = 10 * 60  # seconds = 10 minutes
-PANEL_TITLE = "🎧 Support Request Received"
+# Custom emoji (paste the IDs of other emoji here if you ever change them).
+# If one of them is an ANIMATED emoji, change "<:" to "<a:" / animated=False to animated=True.
+SUPPORT_TITLE_EMOJI = "<:support:1555003977173573684>"   # shown in front of the panel title
+CANCEL_EMOJI = discord.PartialEmoji(name="cancel", id=1554671367142645770, animated=False)
+PANEL_TITLE = f"{SUPPORT_TITLE_EMOJI} Support Request Received"
 _bg_tasks: set = set()
 
 
@@ -526,7 +530,7 @@ async def resolve_alert(interaction: discord.Interaction, member_id: int, note: 
         member_id,
         f"🟢 Resolved by {interaction.user.mention}",
         discord.Color.green(),
-        note="✅ **All done!** A **MODERATOR** has handled your request. Thanks for your patience!",
+        note="## ✅ All done!\nA **MODERATOR** has handled your request.\n*Thanks for your patience!*",
     )
 
 
@@ -617,7 +621,7 @@ class HelpButton(
                 self.member_id,
                 f"🔵 {interaction.user.mention} is handling your request",
                 discord.Color.blue(),
-                note="🔵 **Good news!** A **MODERATOR** picked up your request and will be with you in a moment.",
+                note="## 🔵 A MODERATOR is on it\nSomeone picked up your request and will be with you in a moment.",
             )
 
 
@@ -771,7 +775,7 @@ class DescribeIssueModal(discord.ui.Modal, title="Describe Your Issue"):
                     self.member_id,
                     "📝 Issue sent — waiting for a MODERATOR",
                     discord.Color.gold(),
-                    note="📝 **Thanks!** Your message reached the MODERATORS. One will read it and be with you shortly.",
+                    note="## 📝 Message received\nYour message reached the **MODERATORS**.\n*One will read it and be with you shortly.*",
                 )
 
         # 2) Also post it to the issue reports channel (kept from before).
@@ -811,13 +815,14 @@ class MemberPanelButton(
 
     def __init__(self, action: str, member_id: int, disabled: bool = False):
         if action == "describe":
-            label, style = "📝 Describe Issue", discord.ButtonStyle.primary
+            label, emoji = "Describe Issue", "📝"
         else:
-            label, style = "❌ Cancel Request", discord.ButtonStyle.secondary
+            label, emoji = "Cancel Request", CANCEL_EMOJI
         super().__init__(
             discord.ui.Button(
                 label=label,
-                style=style,
+                emoji=emoji,
+                style=discord.ButtonStyle.secondary,  # grey
                 custom_id=f"member_{action}_{member_id}",
                 disabled=disabled,
             )
@@ -840,7 +845,7 @@ class MemberPanelButton(
             await interaction.response.send_modal(DescribeIssueModal(self.member_id))
             return
 
-        cancel_note = "⚪ This request was cancelled. Join the help channel again any time you need a **MODERATOR**."
+        cancel_note = "## ⚪ Request cancelled\nJoin the help channel again any time you need a **MODERATOR**."
         embed = build_finished_embed(
             interaction.message.embeds[0],
             "⚪ You cancelled this request",
@@ -1171,25 +1176,20 @@ async def send_help_alert(member: discord.Member, voice_channel: discord.VoiceCh
     member_embed = discord.Embed(
         title=PANEL_TITLE,
         description=(
-            f"Hey {member.mention}, you're in the support queue! 👋\n"
-            "A **MODERATOR** will join you as soon as possible — please stay in the voice channel."
+            f"## Hey {member.mention}, you're in the queue!\n"
+            "A **MODERATOR** will join you as soon as possible.\n"
+            "*Please stay in the voice channel.*\n"
+            "\n"
+            "### How to get help faster\n"
+            "> `Describe Issue` — *tell the MODERATORS what's going on*\n"
+            "> `Cancel Request` — *press it if you don't need help anymore*"
         ),
         color=discord.Color.gold(),
     )
     member_embed.set_thumbnail(url=member.display_avatar.url)
     member_embed.add_field(name="Status", value="🟡 Waiting for a MODERATOR", inline=True)
     member_embed.add_field(name="Requested", value=discord.utils.format_dt(discord.utils.utcnow(), "R"), inline=True)
-    member_embed.add_field(name="Estimated Wait", value="~1-5 minutes", inline=True)
-    member_embed.add_field(
-        name="⚡ Get help faster",
-        value="Press **📝 Describe Issue** and tell us what's going on — a MODERATOR reads it before they arrive.",
-        inline=False,
-    )
-    member_embed.add_field(
-        name="Changed your mind?",
-        value="Press **❌ Cancel Request** if you don't need help anymore.",
-        inline=False,
-    )
+    member_embed.add_field(name="Estimated Wait", value="`~1-5 minutes`", inline=True)
     member_embed.set_footer(
         text="ELITE LEADERS COMMUNITY • Support System",
         icon_url=member.guild.icon.url if member.guild.icon else None,
@@ -1252,7 +1252,7 @@ async def on_voice_state_update(
                 "🔴 You left the queue",
                 discord.Color.red(),
                 alert_footer="Member left ❌",
-                note="🔴 You left the voice channel, so this request was closed. Join the help channel again any time you need a **MODERATOR**.",
+                note="## 🔴 You left the queue\nThis request was closed. Join the help channel again any time you need a **MODERATOR**.",
             )
         elif after_id != before_id:
             await close_help_request(
@@ -1260,7 +1260,7 @@ async def on_voice_state_update(
                 "🟢 Resolved — a MODERATOR moved you",
                 discord.Color.green(),
                 alert_footer="Resolved ✅",
-                note="✅ **All done!** A **MODERATOR** moved you, so this request is finished. Thanks for your patience!",
+                note="## ✅ All done!\nA **MODERATOR** moved you, so this request is finished.\n*Thanks for your patience!*",
             )
 
     # Nickname emoji: start it right away as its own task so it runs at the same time as
