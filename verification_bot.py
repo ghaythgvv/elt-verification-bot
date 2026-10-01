@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import os
 import asyncio
+from datetime import timedelta
 
 import discord
 from discord.ext import commands
@@ -121,6 +122,12 @@ UNVERIFIED_ROLE_ID = 1513904174079934657  # removed from the member at verify ti
 VERIFIED_ROLE_ID = 1513904156350353511    # given after verification
 
 EXTRA_ROLES_ON_VERIFY = [1513904151309058159]  # MEMBER role - given alongside Verified
+
+# New-account warning: if the member's Discord account is younger than this many days,
+# the verification message shows a warning line (with the emoji below) so moderators
+# think twice before verifying. Set NEW_ACCOUNT_WARNING_DAYS = 0 to turn it off.
+NEW_ACCOUNT_WARNING_DAYS = 7
+WARN_EMOJI = "<:warn_purple:1554671365490212945>"  # if it's an animated emoji, change "<:" to "<a:"
 # ================================================================
 
 intents = discord.Intents.default()
@@ -1157,9 +1164,27 @@ async def send_verification_alert(member: discord.Member, voice_channel: discord
     invited_by_text = f"Invited by: {inviter.mention}" if inviter else "Invited by: Unknown (vanity URL or unknown invite)"
     joined_text = discord.utils.format_dt(member.joined_at, "R") if member.joined_at else "Unknown"
 
+    # Warning for brand-new accounts (younger than NEW_ACCOUNT_WARNING_DAYS days).
+    warning_text = ""
+    if NEW_ACCOUNT_WARNING_DAYS:
+        account_age = discord.utils.utcnow() - member.created_at
+        if account_age < timedelta(days=NEW_ACCOUNT_WARNING_DAYS):
+            if account_age.days >= 1:
+                age_label = f"{account_age.days} day{'s' if account_age.days != 1 else ''} old"
+            else:
+                hours = max(account_age.seconds // 3600, 0)
+                age_label = "less than an hour old" if hours < 1 else f"{hours} hour{'s' if hours != 1 else ''} old"
+            warning_text = (
+                f"{WARN_EMOJI} **New account warning**\n"
+                f"> This account was created {discord.utils.format_dt(member.created_at, 'R')} "
+                f"(only **{age_label}**, under {NEW_ACCOUNT_WARNING_DAYS} days). "
+                f"Check them carefully before verifying.\n\n"
+            )
+
     embed = discord.Embed(
         title="Member awaiting verification",
         description=(
+            f"{warning_text}"
             f"Member: {member.mention}\n"
             f"ID: `{member.id}`\n"
             f"Account created: {discord.utils.format_dt(member.created_at, 'R')}\n"
