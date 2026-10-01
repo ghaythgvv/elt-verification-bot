@@ -167,7 +167,7 @@ PANEL_DELETE_AFTER = 10 * 60  # seconds = 10 minutes
 SUPPORT_TITLE_EMOJI = "<:support:1555003977173573684>"   # shown in front of the panel title
 CANCEL_EMOJI = discord.PartialEmoji(name="cancel", id=1554671367142645770, animated=False)
 PANEL_TITLE = f"{SUPPORT_TITLE_EMOJI} Support Request Received"
-PURPLE = discord.Color.purple()  # colour used while a MODERATOR has claimed the request
+PURPLE = discord.Color.purple()  # the colour of EVERY embed - change it here to recolour all panels at once
 _bg_tasks: set = set()
 
 
@@ -481,7 +481,7 @@ class VerifyButton(
                 print(f"❌ Failed to change roles for {member}: {e}")
                 return await interaction.followup.send("Something went wrong while changing roles. Try again.", ephemeral=True)
 
-            embed.color = discord.Color.green()
+            embed.color = PURPLE
             embed.add_field(name="Verified", value=f"✅ {interaction.user.mention}", inline=False)
             embed.set_footer(text="Verified ✅")
             member_inviters.pop(self.member_id, None)
@@ -497,7 +497,7 @@ class VerifyButton(
                     except discord.HTTPException as e:
                         print(f"⚠️ Couldn't send welcome message: {e}")
         else:
-            embed.color = discord.Color.red()
+            embed.color = PURPLE
             embed.add_field(name="Rejected", value=f"❌ {interaction.user.mention}", inline=False)
             embed.set_footer(text="Rejected ❌")
             await interaction.edit_original_response(embed=embed, view=verify_view(self.member_id, disabled=True))
@@ -525,7 +525,7 @@ async def resolve_alert(interaction: discord.Interaction, member_id: int, note: 
         return await interaction.response.send_message("This request was already closed.", ephemeral=True)
 
     embed = message.embeds[0].copy()
-    embed.color = discord.Color.green()
+    embed.color = PURPLE
     if note:
         set_field(embed, "What happened", f">>> {note}"[:1024], inline=False)
     set_field(embed, "Status", ALERT_STATUS["Resolved"], inline=True)
@@ -537,7 +537,7 @@ async def resolve_alert(interaction: discord.Interaction, member_id: int, note: 
     await close_help_request(
         member_id,
         f"🟢 Resolved by {interaction.user.mention}",
-        discord.Color.green(),
+        PURPLE,
         note="## All done\nA **MODERATOR** has handled your request.\n*Thanks for your patience.*",
     )
 
@@ -642,8 +642,8 @@ def help_view(member_id: int, claimed: bool = False, disabled: bool = False) -> 
 
 
 class IssueReportView(discord.ui.View):
-    """Simple 'Mark as Seen' button for issue reports, so MODERATORS can tell what's already
-    been looked at without anyone having to delete or reply to the embed."""
+    """'Mark as Seen' button for issue reports. It flips the report to green, shows WHO saw it
+    and WHEN, so MODERATORS can tell what's already been looked at at a glance."""
 
     def __init__(self, seen: bool = False):
         super().__init__(timeout=None)
@@ -656,8 +656,10 @@ class IssueReportView(discord.ui.View):
         embed = interaction.message.embeds[0].copy()
         if any(f.name == "Seen by" for f in embed.fields):
             return await interaction.response.send_message("Already marked as seen.", ephemeral=True)
-        embed.color = discord.Color.green()
-        embed.add_field(name="Seen by", value=interaction.user.mention, inline=False)
+        embed.color = PURPLE
+        set_field(embed, "Status", "🟢 `Seen`", inline=True)
+        set_field(embed, "Seen by", interaction.user.mention, inline=True)
+        set_field(embed, "Seen At", discord.utils.format_dt(discord.utils.utcnow(), "R"), inline=True)
         await interaction.response.edit_message(embed=embed, view=IssueReportView(seen=True))
 
 
@@ -783,7 +785,7 @@ class DescribeIssueModal(discord.ui.Modal, title="Describe Your Issue"):
                 await set_panel_status(
                     self.member_id,
                     "🟡 Issue sent — waiting for a MODERATOR",
-                    discord.Color.gold(),
+                    PURPLE,
                     note="## Message received\nYour message reached the **MODERATORS**.\n*One will read it and be with you shortly.*",
                 )
 
@@ -792,17 +794,38 @@ class DescribeIssueModal(discord.ui.Modal, title="Describe Your Issue"):
             print("⚠️ Couldn't find the issue reports channel — check ISSUE_REPORTS_CHANNEL_ID")
         else:
             embed = discord.Embed(
-                title="New Issue Report",
-                description=f">>> {self.issue.value}",
-                color=discord.Color.orange(),
+                title="Issue Report",
+                description=(
+                    f"## New issue from <@{self.member_id}>\n"
+                    "*Sent from the support panel.*\n"
+                    "\n"
+                    "### Their message\n"
+                    f">>> {self.issue.value}"
+                ),
+                color=PURPLE,
             )
             if member:
                 embed.set_author(name=f"{member.display_name} ({member})", icon_url=member.display_avatar.url)
             else:
                 embed.set_author(name=f"Unknown member ({self.member_id})")
+
+            voice = member.voice.channel if member and member.voice and member.voice.channel else None
+            alert_msg = entry.get("alert") if entry else None
+
+            # Row 1: who
             embed.add_field(name="Member", value=f"<@{self.member_id}>", inline=True)
             embed.add_field(name="User ID", value=f"`{self.member_id}`", inline=True)
-            embed.set_footer(text="Member help panel")
+            embed.add_field(name="Submitted", value=discord.utils.format_dt(discord.utils.utcnow(), "R"), inline=True)
+            # Row 2: where / state / link to the live request
+            embed.add_field(name="Voice Channel", value=voice.mention if voice else "`Not in a voice channel`", inline=True)
+            embed.add_field(name="Status", value="🟡 `Not seen yet`", inline=True)
+            if alert_msg is not None:
+                embed.add_field(name="Help Request", value=f"[Jump to request]({alert_msg.jump_url})", inline=True)
+
+            embed.set_footer(
+                text="ELITE LEADERS COMMUNITY • Issue Reports",
+                icon_url=interaction.guild.icon.url if interaction.guild and interaction.guild.icon else None,
+            )
             embed.timestamp = discord.utils.utcnow()
             try:
                 await send_with_retry(reports_channel, embed=embed, view=IssueReportView())
@@ -858,7 +881,7 @@ class MemberPanelButton(
         embed = build_finished_embed(
             interaction.message.embeds[0],
             "⚪ You cancelled this request",
-            discord.Color.greyple(),
+            PURPLE,
             cancel_note,
         )
         await interaction.response.edit_message(embed=embed, view=panel_view(self.member_id, disabled=True))
@@ -868,7 +891,7 @@ class MemberPanelButton(
         await close_help_request(
             self.member_id,
             "⚪ You cancelled this request",
-            discord.Color.greyple(),
+            PURPLE,
             alert_footer="Cancelled",
             skip_panel=True,  # already edited + scheduled above
         )
@@ -1105,7 +1128,7 @@ async def send_verification_alert(member: discord.Member, voice_channel: discord
             f"{invited_by_text}\n"
             f"Joined voice channel: *{voice_channel.name}*"
         ),
-        color=discord.Color.gold(),
+        color=PURPLE,
     )
     embed.set_thumbnail(url=member.display_avatar.url)
     embed.set_footer(text="Click Verify to let this member in")
@@ -1141,7 +1164,7 @@ async def send_help_alert(member: discord.Member, voice_channel: discord.VoiceCh
             f"## {member.mention} needs a MODERATOR\n"
             f"Waiting in {voice_channel.mention} — *join them to help.*"
         ),
-        color=discord.Color.gold(),
+        color=PURPLE,
     )
     embed.set_thumbnail(url=member.display_avatar.url)
     # Row 1: who
@@ -1203,7 +1226,7 @@ async def send_help_alert(member: discord.Member, voice_channel: discord.VoiceCh
             "> `Describe Issue` — tell the MODERATORS what's wrong so they arrive prepared.\n"
             "> `Cancel Request` — use this if you no longer need help."
         ),
-        color=discord.Color.gold(),
+        color=PURPLE,
     )
     member_embed.set_thumbnail(url=member.display_avatar.url)
     member_embed.add_field(name="Status", value="🟡 Waiting for a MODERATOR", inline=True)
@@ -1269,7 +1292,7 @@ async def on_voice_state_update(
             await close_help_request(
                 member.id,
                 "🔴 You left the queue",
-                discord.Color.red(),
+                PURPLE,
                 alert_footer="Member left",
                 note="## You left the queue\nThis request was closed. Join the help channel again any time you need a **MODERATOR**.",
             )
@@ -1277,7 +1300,7 @@ async def on_voice_state_update(
             await close_help_request(
                 member.id,
                 "🟢 Resolved — a MODERATOR moved you",
-                discord.Color.green(),
+                PURPLE,
                 alert_footer="Resolved",
                 note="## All done\nA **MODERATOR** moved you, so this request is finished.\n*Thanks for your patience.*",
             )
