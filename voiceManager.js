@@ -14,7 +14,7 @@ const pendingDeletions = new Set(); // channelIds with a delete check already qu
 const GAME_CHANNEL_EMOJI = '🎮';
 
 // Fixed (non-temp) voice channels that should still sync their emoji onto
-// anyone sitting in them, same as temp channels do — just for these two
+// anyone sitting in them, same as temp channels do — just for these
 // specific static channels rather than every generated temp channel.
 const STATIC_EMOJI_SYNC_CHANNEL_IDS = new Set([
   '1517941337700176003',
@@ -24,14 +24,26 @@ const STATIC_EMOJI_SYNC_CHANNEL_IDS = new Set([
   '1543346189276160241',
 ]);
 
+// Emoji swaps applied when a static channel's emoji gets copied onto a member's
+// nickname. The channel name itself is NOT changed — only what ends up on the
+// nickname. Add more pairs here any time, e.g. '⛔': '📛'.
+const NICKNAME_EMOJI_REPLACEMENTS = {
+  '✅': '☑️',
+};
+
 // Grabs whatever emoji the channel's own name starts with, so renaming the
 // channel automatically changes what gets applied — no separate config to
 // keep in sync. No trailing-space requirement here (channel names often
 // don't have one), unlike the nickname-prefix matcher in nickname.js.
+// Any emoji listed in NICKNAME_EMOJI_REPLACEMENTS is swapped for its
+// replacement before being returned.
 const LEADING_EMOJI_RE = /^\p{Extended_Pictographic}\uFE0F?/u;
 function getChannelLeadingEmoji(channel) {
   const match = channel?.name?.match(LEADING_EMOJI_RE);
-  return match ? match[0] : null;
+  if (!match) return null;
+  const found = match[0];
+  const plain = found.replace(/\uFE0F/g, ''); // compare without the variation selector
+  return NICKNAME_EMOJI_REPLACEMENTS[found] || NICKNAME_EMOJI_REPLACEMENTS[plain] || found;
 }
 
 // Discord's channel-name validation rejects a few things that easily slip
