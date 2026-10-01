@@ -56,6 +56,7 @@ Before running:
 from __future__ import annotations
 
 import os
+import re
 import asyncio
 from datetime import timedelta
 
@@ -357,11 +358,38 @@ def _strip_alert_prefix(nick: str | None) -> tuple[str | None, bool]:
     return nick, had_prefix
 
 
+# Any emoji / symbol a member might already have at the START of their nickname
+# (e.g. "♾️ ELT KIRA", "★ Name", "🔥 Name"). When the bot adds its own emoji it REMOVES
+# these first, so the member ends up with ONE emoji, not two. Their original nickname is
+# remembered and restored when they leave.
+_EMOJI_CHARS = (
+    "\U0001F000-\U0001FAFF"   # emoji, pictographs, flags, skin tones
+    "\U000E0020-\U000E007F"   # tag characters (used in some flags)
+    "\u00A9\u00AE\u203C\u2049\u2122\u2139"
+    "\u2194-\u21AA\u221E"      # a few arrows + the infinity sign
+    "\u231A-\u23FF"            # watches, hourglass ⏳, media controls
+    "\u24C2\u25AA-\u25FE"
+    "\u2600-\u27BF"            # misc symbols + dingbats (♾ ☑ ✅ ⛔ ★ ✦ ...)
+    "\u2934\u2935\u2B00-\u2BFF\u3030\u303D\u3297\u3299"
+    "\u200D\uFE0F\u20E3"       # joiner, variation selector, keycap
+)
+_LEADING_EMOJI_RE = re.compile(f"^[{_EMOJI_CHARS}\\s]+")
+
+
+def _strip_leading_emoji(text: str | None) -> str:
+    """Remove every emoji / symbol (and the spaces around them) from the START of a name."""
+    if not text:
+        return ""
+    return _LEADING_EMOJI_RE.sub("", text).strip()
+
+
 def _has_exact_prefix(nick: str | None, emoji: str) -> bool:
-    """True only if the nickname starts with exactly ONE of our emoji, and it's `emoji`."""
+    """True only if the nickname is exactly `emoji` + a name that does NOT itself start with
+    another emoji/symbol (so "📛 ♾️ Name" counts as wrong and gets fixed to "📛 Name")."""
     if not nick or not nick.startswith(f"{emoji} "):
         return False
-    return not _strip_alert_prefix(nick[len(emoji) + 1:])[1]
+    rest = nick[len(emoji) + 1:]
+    return bool(rest) and not _LEADING_EMOJI_RE.match(rest)
 
 
 def get_report_vc_base_nickname(member: discord.Member) -> str | None:
@@ -389,8 +417,10 @@ async def set_report_vc_alert(member: discord.Member):
 
     The desired state is read from the member's live voice state (not from whichever
     event called us), and edits are serialized per member, so rapid join/leave/move
-    sequences always end in the correct state. Any emoji already on the name (even two
-    stacked ones, or an old one) is stripped first, so there is never more than one.
+    sequences always end in the correct state. Any emoji the member already has at the
+    start of their nickname (the bot's own, an old one, or their personal one like ♾️) is
+    removed while they wait, so there is only ever ONE emoji. Their original nickname is
+    restored when they leave.
     """
     lock = _nick_locks.setdefault(member.id, asyncio.Lock())
     async with lock:
@@ -400,9 +430,16 @@ async def set_report_vc_alert(member: discord.Member):
 
         if active:
             base_nick = get_report_vc_base_nickname(fresh)
-            visible_name = base_nick or fresh.global_name or fresh.name
-            visible_name, _ = _strip_alert_prefix(visible_name)  # never double up the emoji
-            visible_name = visible_name or fresh.global_name or fresh.name
+            # Use the member's own name WITHOUT any emoji/symbol they already have at the
+            # start of it (e.g. "♾️ ELT KIRA" -> "ELT KIRA"), so the bot's emoji REPLACES
+            # theirs instead of being stacked in front of it. Their original nickname stays
+            # saved in report_vc_base_nicknames and comes back when they leave.
+            visible_name = ""
+            for candidate in (base_nick, fresh.global_name, fresh.name):
+                visible_name = _strip_leading_emoji(candidate)
+                if visible_name:
+                    break
+            visible_name = visible_name or fresh.name
             # Discord server nicknames are limited to 32 characters.
             target_nick = f"{emoji} {visible_name}"[:32]
         else:
