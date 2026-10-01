@@ -11,10 +11,10 @@ How it works:
 2) When a member joins one of the "Waiting for Help" voice channels:
    - The member's own server nickname gets the ⏳ prefix while they wait there
      (and it's removed when they leave).
-   - MODERATOR PANEL: the bot posts an alert pinging @everyone with 3 buttons:
+   - MODERATOR PANEL: the bot posts an alert pinging @everyone with 2 buttons:
          Claim                 -> the member instantly sees WHO is handling them
-         Mark as Resolved      -> one click, done (member panel updates by itself)
-         Resolve + Note        -> same, but lets you write what the problem was
+         Resolve               -> closes the request (popup for an optional note about the
+                                  problem); the member panel updates by itself
      The voice channel name is a clickable link, so a MODERATOR can jump straight in.
    - MEMBER PANEL: the member gets a clean panel with a live Status
          🟡 Waiting for a MODERATOR  ->  🟣 <moderator> is handling your request
@@ -420,9 +420,9 @@ class VerifyButton(
 ):
     def __init__(self, action: str, member_id: int, disabled: bool = False):
         if action == "accept":
-            label, style = "✅ Verify", discord.ButtonStyle.success
+            label, style = "✅ Verify", discord.ButtonStyle.secondary
         else:
-            label, style = "❌ Reject", discord.ButtonStyle.danger
+            label, style = "❌ Reject", discord.ButtonStyle.secondary
         super().__init__(
             discord.ui.Button(
                 label=label,
@@ -543,7 +543,7 @@ async def resolve_alert(interaction: discord.Interaction, member_id: int, note: 
 
 
 class ResolveNoteModal(discord.ui.Modal, title="Resolve Help Request"):
-    """Popup asking what the problem was, shown when a MODERATOR clicks Resolve + Note."""
+    """Popup asking what the problem was, shown when a MODERATOR clicks Resolve."""
 
     note = discord.ui.TextInput(
         label="What was the problem? (optional)",
@@ -578,11 +578,11 @@ class HelpButton(
 
     def __init__(self, action: str, member_id: int, disabled: bool = False):
         if action == "claim":
-            label, style = "Claim", discord.ButtonStyle.primary
+            label, style = "Claim", discord.ButtonStyle.secondary
         elif action == "resolved":
-            label, style = "Mark as Resolved", discord.ButtonStyle.success
+            label, style = "Mark as Resolved", discord.ButtonStyle.secondary
         else:
-            label, style = "Resolve + Note", discord.ButtonStyle.secondary
+            label, style = "Resolve", discord.ButtonStyle.secondary
         super().__init__(
             discord.ui.Button(
                 label=label,
@@ -637,7 +637,6 @@ class HelpButton(
 def help_view(member_id: int, claimed: bool = False, disabled: bool = False) -> discord.ui.View:
     view = discord.ui.View(timeout=None)
     view.add_item(HelpButton("claim", member_id, disabled or claimed))
-    view.add_item(HelpButton("resolved", member_id, disabled))
     view.add_item(HelpButton("note", member_id, disabled))
     return view
 
@@ -652,7 +651,7 @@ class IssueReportView(discord.ui.View):
             self.mark_seen.label = "Seen"
             self.mark_seen.disabled = True
 
-    @discord.ui.button(label="Mark as Seen", style=discord.ButtonStyle.success, custom_id="issue_report_seen")
+    @discord.ui.button(label="Mark as Seen", style=discord.ButtonStyle.secondary, custom_id="issue_report_seen")
     async def mark_seen(self, interaction: discord.Interaction, button: discord.ui.Button):
         embed = interaction.message.embeds[0].copy()
         if any(f.name == "Seen by" for f in embed.fields):
@@ -1157,7 +1156,7 @@ async def send_help_alert(member: discord.Member, voice_channel: discord.VoiceCh
         # Filled in automatically when the member presses "Describe Issue".
         embed.add_field(name="Issue", value="*The member hasn't described the issue yet.*", inline=False)
     embed.set_footer(
-        text="ELITE LEADERS COMMUNITY • Press Claim first, then Mark as Resolved when it's handled",
+        text="ELITE LEADERS COMMUNITY • Press Claim first, then Resolve when it's handled",
         icon_url=member.guild.icon.url if member.guild.icon else None,
     )
     embed.timestamp = discord.utils.utcnow()
