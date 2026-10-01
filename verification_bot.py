@@ -22,14 +22,16 @@ How it works:
      plus "Describe Issue" and "Cancel Request" buttons.
    - When the member presses "Describe Issue", their text is added to the MODERATOR alert
      (so moderators see everything in ONE place) and also posted to ISSUE_REPORTS_CHANNEL_ID.
-   - If the member leaves, cancels, or gets moved, the MODERATOR alert closes by itself.
+   - If the member leaves or cancels, the MODERATOR alert closes by itself.
+     If the member is MOVED to another channel, the alert stays OPEN (status "Member moved")
+     so a moderator can still press Claim / Resolve and leave a note.
    - Once the member panel is finished (🟢 resolved / 🔴 left / ⚪ cancelled) it is
      DELETED automatically 10 minutes later (set PANEL_DELETE_AFTER to change this).
    - Each waiting-for-help channel has its own emoji shown in the alert title, and can
      independently turn the member-facing panel on or off (see HELP_VC_CONFIG below).
 3) When a member joins one of the "REPORT" voice channels:
    - No message is sent anywhere. Instead the bot prefixes that member's own server
-     nickname with ⛔ while they're waiting in the channel, and removes
+     nickname with 📛 while they're waiting in the channel, and removes
      it again the moment they leave (see REPORT_VC_IDS below).
 4) When anyone clicks Verify:
    - The "Verified" role and "Member" role (or any other roles you set) get added.
@@ -88,15 +90,20 @@ HELP_VC_CONFIG = {
 # prefixes THEIR OWN server nickname with the channel's emoji. As soon as they leave,
 # their nickname is restored.
 #   - Waiting for Move + every Waiting for Help channel -> WAITING_VC_EMOJI (⏳)
-#   - REPORT channels                                   -> REPORT_VC_EMOJI  (⛔)
+#   - REPORT channels                                   -> REPORT_VC_EMOJI  (📛)
 WAITING_VC_EMOJI = "⏳"
-REPORT_VC_EMOJI = "⛔"
+REPORT_VC_EMOJI = "📛"
+# Emoji the bot used in the past. They are still recognised (and stripped) so nicknames
+# that still carry an old emoji get cleaned up instead of ending up with two emoji.
+LEGACY_ALERT_EMOJIS = {"⛔"}
 REPORT_VC_IDS = {
     1517940974125318166,
-    1554981588880850964,  # new REPORT channel (members joining it get their own room + the ⛔ emoji)
+    1554981588880850964,  # new REPORT channel (members joining it get their own room + the 📛 emoji)
 }
 REPORT_CATEGORY_ID = 1517941029221695760
-REPORT_CHANNEL_NAME = "⛔┃𝗥𝗘𝗣𝗢𝗥𝗧"  # name of the voice channel created for each report
+REPORT_CHANNEL_NAME = "📛┃𝗥𝗘𝗣𝗢𝗥𝗧"  # name of the voice channel created for each report
+# Old names of the report rooms, so rooms created before the emoji change are still recognised.
+LEGACY_REPORT_CHANNEL_NAMES = {"⛔┃𝗥𝗘𝗣𝗢𝗥𝗧"}
 
 # {voice channel id: emoji to put on the member's nickname}
 ALERT_VC_EMOJIS = {
@@ -106,6 +113,8 @@ ALERT_VC_EMOJIS = {
 }
 ALERT_VC_IDS = set(ALERT_VC_EMOJIS)
 ALERT_EMOJIS = set(ALERT_VC_EMOJIS.values())
+# Every emoji we might find at the start of a nickname (current + old), longest first.
+_STRIPPABLE_EMOJIS = sorted(ALERT_EMOJIS | LEGACY_ALERT_EMOJIS, key=len, reverse=True)
 
 # Roles
 UNVERIFIED_ROLE_ID = 1513904174079934657  # removed from the member at verify time if they have it (not given automatically anymore)
@@ -152,12 +161,15 @@ help_panels = {}
 _startup_sync_done = False  # on_ready can fire many times (reconnects) - only sync nicknames once
 
 # Footers that mean "this MODERATOR alert is finished" (buttons are disabled).
-ALERT_DONE_FOOTERS = ("Resolved", "Member left", "Cancelled", "Resolved ✅", "Member left ❌", "Cancelled ⚪")
+# NOTE: "Member moved" is deliberately NOT in this list - the alert stays open so a
+# moderator can still press Claim / Resolve.
+ALERT_DONE_FOOTERS = ("Resolved", "Member left", "Cancelled", "Resolved ✅", "Resolved ☑️", "Member left ❌", "Cancelled ⚪")
 # What the "Status" field of the MODERATOR alert says in each final state.
 ALERT_STATUS = {
     "Resolved": "🟢 `Resolved`",
     "Member left": "🔴 `Member left`",
     "Cancelled": "⚪ `Cancelled`",
+    "Member moved": "🔵 `Member moved`",
 }
 
 # Finished member panels (resolved / left / cancelled) delete themselves after this long.
@@ -235,7 +247,7 @@ def get_field(embed: discord.Embed, name: str) -> str | None:
     return None
 
 
-# ====================== Nickname emoji (⏳ waiting / ⛔ report) ======================
+# ====================== Nickname emoji (⏳ waiting / 📛 report) ======================
 report_room_ids: set[int] = set()  # rooms created by the bot during this run (tracked by ID)
 
 
@@ -249,7 +261,7 @@ def _is_report_room(channel) -> bool:
         return True
     return (
         getattr(channel, "category_id", None) == REPORT_CATEGORY_ID
-        and channel.name == REPORT_CHANNEL_NAME
+        and (channel.name == REPORT_CHANNEL_NAME or channel.name in LEGACY_REPORT_CHANNEL_NAMES)
     )
 
 
@@ -289,7 +301,7 @@ async def create_report_room(member: discord.Member):
     try:
         await member.move_to(room, reason="Moved into their report room")
         print(f"✅ Report room created for {member}")
-        # Put the ⛔ on right now - don't wait for the voice event (it can arrive late).
+        # Put the 📛 on right now - don't wait for the voice event (it can arrive late).
         await asyncio.sleep(0.5)
         await set_report_vc_alert(member)
     except discord.Forbidden:
@@ -321,13 +333,28 @@ def _in_alert_vc(member: discord.Member) -> bool:
 
 
 def _strip_alert_prefix(nick: str | None) -> tuple[str | None, bool]:
-    """Remove one of OUR emoji prefixes from a nickname. Returns (clean_nick, had_prefix)."""
-    if nick:
-        for emoji in ALERT_EMOJIS:
-            prefix = f"{emoji} "
-            if nick.startswith(prefix):
-                return nick[len(prefix):], True
-    return nick, False
+    """Remove ALL of our emoji prefixes (current and old ones) from the start of a nickname,
+    however many are stacked there. Returns (clean_nick, had_prefix).
+    Stripping every one is what stops a member ending up with two emoji."""
+    had_prefix = False
+    while nick:
+        for emoji in _STRIPPABLE_EMOJIS:
+            if nick.startswith(emoji):
+                nick = nick[len(emoji):].lstrip()
+                had_prefix = True
+                break
+        else:
+            break
+    if had_prefix and not nick:
+        nick = None
+    return nick, had_prefix
+
+
+def _has_exact_prefix(nick: str | None, emoji: str) -> bool:
+    """True only if the nickname starts with exactly ONE of our emoji, and it's `emoji`."""
+    if not nick or not nick.startswith(f"{emoji} "):
+        return False
+    return not _strip_alert_prefix(nick[len(emoji) + 1:])[1]
 
 
 def get_report_vc_base_nickname(member: discord.Member) -> str | None:
@@ -350,12 +377,13 @@ async def set_report_vc_alert(member: discord.Member):
     """Make the member's nickname match where they are RIGHT NOW.
 
     Waiting for Move / Waiting for Help voice channel -> nickname gets the ⏳ prefix.
-    REPORT voice channel                              -> nickname gets the ⛔ prefix.
+    REPORT voice channel                              -> nickname gets the 📛 prefix.
     Anywhere else                                     -> the original nickname is restored.
 
     The desired state is read from the member's live voice state (not from whichever
     event called us), and edits are serialized per member, so rapid join/leave/move
-    sequences always end in the correct state.
+    sequences always end in the correct state. Any emoji already on the name (even two
+    stacked ones, or an old one) is stripped first, so there is never more than one.
     """
     lock = _nick_locks.setdefault(member.id, asyncio.Lock())
     async with lock:
@@ -367,6 +395,7 @@ async def set_report_vc_alert(member: discord.Member):
             base_nick = get_report_vc_base_nickname(fresh)
             visible_name = base_nick or fresh.global_name or fresh.name
             visible_name, _ = _strip_alert_prefix(visible_name)  # never double up the emoji
+            visible_name = visible_name or fresh.global_name or fresh.name
             # Discord server nicknames are limited to 32 characters.
             target_nick = f"{emoji} {visible_name}"[:32]
         else:
@@ -420,7 +449,7 @@ class VerifyButton(
 ):
     def __init__(self, action: str, member_id: int, disabled: bool = False):
         if action == "accept":
-            label, style = "✅ Verify", discord.ButtonStyle.secondary
+            label, style = "☑️ Verify", discord.ButtonStyle.secondary
         else:
             label, style = "❌ Reject", discord.ButtonStyle.secondary
         super().__init__(
@@ -442,7 +471,7 @@ class VerifyButton(
         # Defer first to prevent timeout
         await interaction.response.defer()
 
-        if _already_done(interaction.message, ("Verified ✅", "Rejected ❌")):
+        if _already_done(interaction.message, ("Verified ☑️", "Verified ✅", "Rejected ❌")):
             return await interaction.followup.send("This request was already handled.", ephemeral=True)
 
         embed = interaction.message.embeds[0].copy()
@@ -482,8 +511,8 @@ class VerifyButton(
                 return await interaction.followup.send("Something went wrong while changing roles. Try again.", ephemeral=True)
 
             embed.color = PURPLE
-            embed.add_field(name="Verified", value=f"✅ {interaction.user.mention}", inline=False)
-            embed.set_footer(text="Verified ✅")
+            embed.add_field(name="Verified", value=f"☑️ {interaction.user.mention}", inline=False)
+            embed.set_footer(text="Verified ☑️")
             member_inviters.pop(self.member_id, None)
             await interaction.edit_original_response(embed=embed, view=verify_view(self.member_id, disabled=True))
 
@@ -706,10 +735,15 @@ async def close_help_request(
     alert_footer: str | None = None,
     skip_panel: bool = False,
     note: str | None = None,
+    lock_alert: bool = True,
 ):
     """Finishes a help request: the member panel gets its final look, its buttons are
     disabled, and it is DELETED after 10 minutes. If `alert_footer` is given, the MODERATOR
-    alert is closed too (used when the member leaves, cancels, or gets moved)."""
+    alert is updated too (used when the member leaves, cancels, or gets moved).
+
+    lock_alert=True  -> the alert's buttons are disabled (request is over).
+    lock_alert=False -> the alert only gets its new Status; Claim / Resolve stay pressable
+                        so a moderator can still handle it and leave a note."""
     entry = help_panels.pop(member_id, None)
     if entry is None:
         return
@@ -735,7 +769,11 @@ async def close_help_request(
                 embed.color = color
                 set_field(embed, "Status", ALERT_STATUS.get(alert_footer, alert_footer), inline=True)
                 embed.set_footer(text=alert_footer, icon_url=embed.footer.icon_url)
-                await fresh.edit(embed=embed, view=help_view(member_id, disabled=True))
+                if lock_alert:
+                    view = help_view(member_id, disabled=True)
+                else:
+                    view = help_view(member_id, claimed=_is_claimed(embed))
+                await fresh.edit(embed=embed, view=view)
         except discord.NotFound:
             pass
         except discord.HTTPException as e:
@@ -915,8 +953,9 @@ async def setup_hook():
 async def nickname_watchdog():
     """Safety net so EVERY member in a waiting / help / report room always has their emoji.
     Every 15 seconds it checks everyone sitting in those channels and fixes any nickname
-    that is missing its emoji (for example if a nickname edit was rate-limited or lost a race).
-    Members who already have the right emoji are skipped, so it costs nothing."""
+    that is missing its emoji or has more than one (for example if a nickname edit was
+    rate-limited or lost a race). Members who already have exactly the right emoji are
+    skipped, so it costs nothing."""
     await bot.wait_until_ready()
     while not bot.is_closed():
         try:
@@ -931,8 +970,8 @@ async def nickname_watchdog():
                         if m.bot or m.id in _nick_failed:
                             continue
                         want = _alert_emoji_for(m)
-                        if want and not (m.nick or "").startswith(f"{want} "):
-                            print(f"🔧 Watchdog: {m} is missing {want}, fixing")
+                        if want and not _has_exact_prefix(m.nick, want):
+                            print(f"🔧 Watchdog: {m} has the wrong/missing emoji (want {want}), fixing")
                             await set_report_vc_alert(m)
         except Exception as e:
             print(f"⚠️ Nickname watchdog error: {e}")
@@ -982,7 +1021,7 @@ async def on_ready():
 
     # The emoji feature can't work without this permission - say so loudly at startup.
     if not guild.me.guild_permissions.manage_nicknames:
-        print("⚠️ The bot is missing the 'Manage Nicknames' permission — the ⏳/⛔ nickname emoji will NOT work until you give it")
+        print("⚠️ The bot is missing the 'Manage Nicknames' permission — the ⏳/📛 nickname emoji will NOT work until you give it")
 
     # Sync nickname state in case people were already waiting when the bot started
     # (or it crashed mid-rename last time). This covers Waiting for Move, Waiting for
@@ -1268,11 +1307,11 @@ async def on_voice_state_update(
         * adds ⏳ to the member's nickname
         * sends the MODERATOR alert / member panel
     - Report VCs:
-        * adds ⛔ to the member's nickname
+        * adds 📛 to the member's nickname
     - When a member leaves these VCs:
         * removes the emoji and restores their previous nickname
 
-    Moving directly between these channels swaps the emoji if needed (⏳ <-> ⛔).
+    Moving directly between these channels swaps the emoji if needed (⏳ <-> 📛).
     """
     if member.guild.id != GUILD_ID or member.bot:
         return
@@ -1286,9 +1325,10 @@ async def on_voice_state_update(
 
     _nick_failed.discard(member.id)  # new channel -> try renaming again
 
-    # Help panel cleanup when a member leaves a help VC. Both panels get closed.
+    # Help panel cleanup when a member leaves a help VC.
     if member.id in help_panels and before_id in HELP_VC_CONFIG:
         if after_id is None:
+            # Left voice entirely -> close both panels.
             await close_help_request(
                 member.id,
                 "🔴 You left the queue",
@@ -1297,11 +1337,15 @@ async def on_voice_state_update(
                 note="## You left the queue\nThis request was closed. Join the help channel again any time you need a **MODERATOR**.",
             )
         elif after_id != before_id:
+            # Moved to another channel -> the member panel finishes, but the MODERATOR
+            # alert stays OPEN (Claim / Resolve keep working) so it can still be handled
+            # and a note can be left.
             await close_help_request(
                 member.id,
                 "🟢 Resolved — a MODERATOR moved you",
                 PURPLE,
-                alert_footer="Resolved",
+                alert_footer="Member moved",
+                lock_alert=False,
                 note="## All done\nA **MODERATOR** moved you, so this request is finished.\n*Thanks for your patience.*",
             )
 
