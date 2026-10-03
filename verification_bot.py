@@ -788,7 +788,7 @@ async def refresh_shared_panel(guild: discord.Guild):
         embed = build_shared_embed(guild)
         if shared_panel is not None:
             try:
-                await shared_panel.edit(embed=embed, view=panel_view())
+                await shared_panel.edit(content=None, embed=embed, view=panel_view())  # content=None wipes any old text above the panel
                 return
             except discord.NotFound:
                 shared_panel = None  # someone deleted it -> send a new one below
