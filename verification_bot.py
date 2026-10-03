@@ -143,6 +143,10 @@ WARN_EMOJI = "<:warn_purple:1554671365490212945>"  # if it's an animated emoji, 
 #   - REPORT_ROOM_COOLDOWN: minimum seconds between creating report rooms for the same member.
 #     A member who already has a report room is moved back into it instead of getting another.
 VERIFY_REALERT_COOLDOWN = 5 * 60
+#   - HELP_LEAVE_GRACE: when a member leaves the help channel, their request stays open for this
+#     many seconds. If they come back in that time (bad connection, accidental click, spam
+#     leave/join) nothing is closed and NO new @everyone alert is sent.
+HELP_LEAVE_GRACE = 20
 REPORT_ROOM_COOLDOWN = 10
 # ================================================================
 
@@ -188,6 +192,7 @@ _verify_locks: dict[int, asyncio.Lock] = {}
 member_report_rooms: dict[int, int] = {}  # member_id -> id of the report room made for them
 _report_locks: dict[int, asyncio.Lock] = {}
 _report_last_created: dict[int, float] = {}
+_leave_tasks: dict[int, asyncio.Task] = {}   # member_id -> pending 'close after grace' task
 VERIFY_OPEN_FOOTER = "Click Verify to let this member in"
 
 # The ONE shared member panel in #describe-issue (a single message for everyone).
@@ -950,6 +955,128 @@ async def close_help_request(
         await refresh_shared_panel(guild)
 
 
+# ====================== Recovery (restarts) + leave grace period ======================
+def entry_from_alert(msg: discord.Message, config: dict) -> dict:
+    """Rebuilds a help_panels entry from an alert message that is still open."""
+    embed = msg.embeds[0]
+    claimed_by = get_field(embed, "Claimed by")
+    issue = get_field(embed, "Issue")
+    described = bool(issue) and "hasn't described" not in issue
+    if claimed_by:
+        status = f"🟣 {claimed_by} is handling your request"
+    elif described:
+        status = "🟡 Message sent — waiting for a moderator"
+    else:
+        status = "🟡 Waiting for a moderator"
+    return {
+        "alert": msg,
+        "described": described,
+        "claimed": bool(claimed_by),
+        "show": config.get("send_member_panel", True),
+        "status": status,
+        "joined_at": msg.created_at,
+    }
+
+
+async def scan_latest_alerts(channel) -> dict[int, discord.Message]:
+    """{member_id: newest mod alert the bot posted for them} (open or finished)."""
+    latest: dict[int, discord.Message] = {}
+    try:
+        async for msg in channel.history(limit=100):  # newest first
+            if msg.author.id != bot.user.id or not msg.embeds:
+                continue
+            for row in msg.components:
+                for c in getattr(row, "children", []):
+                    m = re.fullmatch(r"help_(?:claim|resolved|note)_(\d+)", getattr(c, "custom_id", None) or "")
+                    if m:
+                        latest.setdefault(int(m.group(1)), msg)
+    except (discord.Forbidden, discord.HTTPException) as e:
+        print(f"⚠️ Couldn't read the help alert channel history: {e}")
+    return latest
+
+
+def _alert_is_open(msg: discord.Message) -> bool:
+    """Open = still needs handling. ('Member moved' alerts are open on purpose, but the
+    member is no longer waiting, so they don't count as a live request.)"""
+    footer = msg.embeds[0].footer.text if msg.embeds else None
+    return footer not in ALERT_DONE_FOOTERS and footer != "Member moved"
+
+
+async def recover_help_request_for(member: discord.Member) -> bool:
+    """Used when a member presses a panel button but the bot has no record of their request
+    (for example the bot restarted while they were waiting). Re-attaches their still-open
+    mod alert. Never creates a new alert."""
+    channel = member.guild.get_channel(HELP_ALERT_CHANNEL_ID)
+    vc = member.voice.channel if member.voice else None
+    if channel is None or vc is None or vc.id not in HELP_VC_CONFIG:
+        return False
+    msg = (await scan_latest_alerts(channel)).get(member.id)
+    if msg is None or not _alert_is_open(msg):
+        return False
+    if member.id not in help_panels:
+        help_panels[member.id] = entry_from_alert(msg, HELP_VC_CONFIG[vc.id])
+        await refresh_shared_panel(member.guild)
+    return True
+
+
+async def recover_help_requests(guild: discord.Guild):
+    """Runs once at startup so a restart / redeploy never loses the queue:
+    - members waiting with a still-open alert  -> their request is re-attached
+    - members waiting with no alert at all (or whose last one ended by leaving / cancelling)
+      -> a fresh alert is sent
+    - members waiting whose last alert was Resolved -> left alone
+    - open alerts of members who are no longer waiting -> closed as 'Member left'"""
+    alert_channel = guild.get_channel(HELP_ALERT_CHANNEL_ID)
+    if alert_channel is None:
+        return
+    latest = await scan_latest_alerts(alert_channel)
+
+    waiting: dict[int, tuple[discord.Member, discord.abc.GuildChannel]] = {}
+    for vc_id in HELP_VC_CONFIG:
+        vc = guild.get_channel(vc_id)
+        if isinstance(vc, (discord.VoiceChannel, discord.StageChannel)):
+            for m in vc.members:
+                if not m.bot:
+                    waiting[m.id] = (m, vc)
+
+    for mid, msg in latest.items():
+        if mid not in waiting and _alert_is_open(msg):
+            try:
+                embed = msg.embeds[0].copy()
+                embed.color = PURPLE
+                set_field(embed, "Status", ALERT_STATUS["Member left"], inline=True)
+                embed.set_footer(text="Member left", icon_url=embed.footer.icon_url)
+                await msg.edit(embed=embed, view=help_view(mid, disabled=True))
+            except discord.HTTPException:
+                pass
+
+    for mid, (m, vc) in waiting.items():
+        msg = latest.get(mid)
+        config = HELP_VC_CONFIG[vc.id]
+        if msg is not None and _alert_is_open(msg):
+            help_panels[mid] = entry_from_alert(msg, config)
+            print(f"♻️ Recovered help request for {m}")
+        elif msg is not None and msg.embeds and msg.embeds[0].footer.text in ("Resolved", "Resolved ✅", "Resolved ☑️"):
+            continue  # already handled, still sitting in the channel
+        else:
+            print(f"♻️ {m} is waiting with no open alert — sending one")
+            await send_help_alert(m, vc, config, ping=False)
+
+
+async def close_after_grace(member_id: int):
+    """Closes a request only if the member did NOT come back within HELP_LEAVE_GRACE seconds."""
+    try:
+        await asyncio.sleep(HELP_LEAVE_GRACE)
+    except asyncio.CancelledError:
+        return
+    _leave_tasks.pop(member_id, None)
+    guild = bot.get_guild(GUILD_ID)
+    m = guild.get_member(member_id) if guild else None
+    if m and m.voice and m.voice.channel and m.voice.channel.id in HELP_VC_CONFIG:
+        return  # they are back
+    await close_help_request(member_id, "🔴 Left the queue", PURPLE, alert_footer="Member left")
+
+
 class DescribeIssueModal(discord.ui.Modal, title="Describe Your Issue"):
     issue = discord.ui.TextInput(
         label="What do you need help with?",
@@ -1074,11 +1201,20 @@ class MemberPanelButton(
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         entry = help_panels.get(interaction.user.id)
+        member = interaction.guild.get_member(interaction.user.id) if interaction.guild else None
+        in_help = bool(member and member.voice and member.voice.channel and member.voice.channel.id in HELP_VC_CONFIG)
+
+        if entry is None and in_help:
+            # The bot may have restarted while they were waiting -> re-attach their open alert.
+            if await recover_help_request_for(member):
+                entry = help_panels.get(interaction.user.id)
+
         if entry is None or not entry.get("show"):
-            await interaction.response.send_message(
-                "You don't have an active request. Join the **Waiting for Help** voice channel and you will be added to this panel.",
-                ephemeral=True,
-            )
+            if in_help:
+                text = "Your request is already closed. Leave and rejoin the **Waiting for Help** voice channel to open a new one."
+            else:
+                text = "You don't have an active request. Join the **Waiting for Help** voice channel and you will be added to this panel."
+            await interaction.response.send_message(text, ephemeral=True)
             return False
         return True
 
@@ -1202,6 +1338,10 @@ async def on_ready():
 
     # Make sure there is exactly ONE shared panel in #describe-issue (deletes old extra ones).
     await ensure_shared_panel(guild)
+
+    # Rebuild the help queue after a restart / redeploy, so waiting members keep working buttons.
+    await recover_help_requests(guild)
+    await refresh_shared_panel(guild)
 
 
 @bot.event
@@ -1408,19 +1548,11 @@ async def _send_verification_alert(member: discord.Member, voice_channel: discor
         print(f"❌ Failed to send verification message: {e}")
 
 
-async def send_help_alert(member: discord.Member, voice_channel: discord.VoiceChannel, config: dict):
-    """Posts the mod panel (alert + Claim / Resolve buttons) and, if turned on for this
-    channel, adds the member to the shared panel in #describe-issue. `config` is this VC's entry from HELP_VC_CONFIG."""
-    help_channel = member.guild.get_channel(HELP_ALERT_CHANNEL_ID)
-    if help_channel is None:
-        print("⚠️ Couldn't find the help alert channel — check HELP_ALERT_CHANNEL_ID")
-        return
-
-    # Already has an active request -> never send a second panel / alert.
+def reserve_help_request(member: discord.Member, config: dict) -> bool:
+    """Creates the member's request entry right away (before any await), so a second voice event
+    can never start a second request. Returns False if they already have one."""
     if member.id in help_panels:
-        print(f"⏭️ {member} already has an active help request, skipping")
-        return
-    # Reserve the slot NOW so a second voice event can't slip in while we await below.
+        return False
     help_panels[member.id] = {
         "alert": None,
         "described": False,
@@ -1429,6 +1561,24 @@ async def send_help_alert(member: discord.Member, voice_channel: discord.VoiceCh
         "status": "🟡 Waiting for a moderator",
         "joined_at": discord.utils.utcnow(),
     }
+    return True
+
+
+async def send_help_alert(member: discord.Member, voice_channel: discord.VoiceChannel, config: dict, ping: bool = True):
+    """Posts the mod panel (alert + Claim / Resolve buttons) and, if turned on for this
+    channel, adds the member to the shared panel in #describe-issue. `config` is this VC's entry from HELP_VC_CONFIG."""
+    if not reserve_help_request(member, config):
+        print(f"⏭️ {member} already has an active help request, skipping")
+        return
+    await _post_help_alert(member, voice_channel, config, ping)
+
+
+async def _post_help_alert(member: discord.Member, voice_channel: discord.VoiceChannel, config: dict, ping: bool = True):
+    help_channel = member.guild.get_channel(HELP_ALERT_CHANNEL_ID)
+    if help_channel is None:
+        print("⚠️ Couldn't find the help alert channel — check HELP_ALERT_CHANNEL_ID")
+        help_panels.pop(member.id, None)
+        return
 
     emoji = config.get("emoji", "")
     print(f"📤 Sending help alert for {member} ({emoji})")
@@ -1494,7 +1644,7 @@ async def send_help_alert(member: discord.Member, voice_channel: discord.VoiceCh
     # Add the member to the ONE shared panel (their @mention is listed inside it).
     await refresh_shared_panel(member.guild)
 
-    if PING_ON_JOIN:
+    if PING_ON_JOIN and ping:
         ping_channel = member.guild.get_channel(MEMBER_HELP_PANEL_CHANNEL_ID)
         if isinstance(ping_channel, discord.TextChannel):
             task = asyncio.create_task(ping_member(ping_channel, member))
@@ -1540,14 +1690,13 @@ async def on_voice_state_update(
     # Help panel cleanup when a member leaves a help VC.
     if member.id in help_panels and before_id in HELP_VC_CONFIG:
         if after_id is None:
-            # Left voice entirely -> close both panels.
-            await close_help_request(
-                member.id,
-                "🔴 You left the queue",
-                PURPLE,
-                alert_footer="Member left",
-                note="## You left the queue\nThis request is closed. Join the help channel again any time you need a **moderator**.",
-            )
+            # Left voice entirely -> keep the request open for a short grace period. If they come
+            # back in time nothing happens; if not, both panels are closed.
+            entry = help_panels.get(member.id)
+            if entry is not None and member.id not in _leave_tasks:
+                _leave_tasks[member.id] = asyncio.create_task(close_after_grace(member.id))
+                entry["status_before"] = entry["status"]
+                await set_panel_status(member.id, "🟠 Disconnected — waiting for them to reconnect")
         elif after_id != before_id:
             # Moved to another channel -> the member panel finishes, but the mod
             # alert stays OPEN (Claim / Resolve keep working) so it can still be handled
@@ -1587,6 +1736,13 @@ async def on_voice_state_update(
                 await send_verification_alert(member, after.channel)
 
         elif after_id in HELP_VC_CONFIG:
+            # Back within the grace period? -> keep the same request, no new alert.
+            pending = _leave_tasks.pop(member.id, None)
+            if pending is not None:
+                pending.cancel()
+                entry = help_panels.get(member.id)
+                if entry is not None:
+                    await set_panel_status(member.id, entry.pop("status_before", "🟡 Waiting for a moderator"))
             if isinstance(after.channel, (discord.VoiceChannel, discord.StageChannel)):
                 await send_help_alert(
                     member,
