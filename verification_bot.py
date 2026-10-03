@@ -61,6 +61,7 @@ from __future__ import annotations
 import os
 import re
 import asyncio
+import time
 from datetime import timedelta
 
 import discord
@@ -134,6 +135,15 @@ EXTRA_ROLES_ON_VERIFY = [1513904151309058159]  # MEMBER role - given alongside V
 # think twice before verifying. Set NEW_ACCOUNT_WARNING_DAYS = 0 to turn it off.
 NEW_ACCOUNT_WARNING_DAYS = 7
 WARN_EMOJI = "<:warn_purple:1554671365490212945>"  # if it's an animated emoji, change "<:" to "<a:"
+# Anti-spam: members who keep leaving and re-joining the voice channels.
+#   - VERIFY_REALERT_COOLDOWN: while a member's verification request is still open, re-joining
+#     NEVER posts a new one (the open one just gets a "Rejoined" counter). After it was
+#     handled (e.g. Rejected), a new request for the same member is only allowed after this
+#     many seconds.
+#   - REPORT_ROOM_COOLDOWN: minimum seconds between creating report rooms for the same member.
+#     A member who already has a report room is moved back into it instead of getting another.
+VERIFY_REALERT_COOLDOWN = 5 * 60
+REPORT_ROOM_COOLDOWN = 10
 # ================================================================
 
 intents = discord.Intents.default()
@@ -171,6 +181,14 @@ _nick_failed: set[int] = set()
 # An entry here means "this member has an ACTIVE request": it is what the shared panel lists
 # and what stops a second alert from ever being sent for the same member.
 help_panels = {}
+
+# Anti-spam state
+verify_alerts: dict[int, dict] = {}       # member_id -> {"message": msg, "rejoins": int, "last_edit": float}
+_verify_locks: dict[int, asyncio.Lock] = {}
+member_report_rooms: dict[int, int] = {}  # member_id -> id of the report room made for them
+_report_locks: dict[int, asyncio.Lock] = {}
+_report_last_created: dict[int, float] = {}
+VERIFY_OPEN_FOOTER = "Click Verify to let this member in"
 
 # The ONE shared member panel in #describe-issue (a single message for everyone).
 shared_panel: discord.Message | None = None
@@ -282,41 +300,74 @@ def _alert_emoji_for(member: discord.Member) -> str | None:
 
 
 async def create_report_room(member: discord.Member):
-    """Creates a fresh report voice channel in the REPORT category and moves the member into it."""
+    """Gives the member a report room and moves them into it - WITHOUT spam.
+    - One at a time per member (a lock), so a burst of join events can't create many rooms.
+    - A member who already has a report room is moved back into it instead of getting a new one.
+    - A short cooldown between creations for the same member."""
     guild = member.guild
-    category = guild.get_channel(REPORT_CATEGORY_ID)
-    if not isinstance(category, discord.CategoryChannel):
-        print("⚠️ Couldn't find the REPORT category — check REPORT_CATEGORY_ID")
-        return
+    lock = _report_locks.setdefault(member.id, asyncio.Lock())
+    async with lock:
+        def _in_trigger() -> bool:
+            m = guild.get_member(member.id)
+            return bool(m and m.voice and m.voice.channel and m.voice.channel.id in REPORT_VC_IDS)
 
-    try:
-        room = await guild.create_voice_channel(
-            REPORT_CHANNEL_NAME,
-            category=category,
-            overwrites=category.overwrites,
-            reason=f"Report room for {member}",
-        )
-    except discord.Forbidden:
-        print("⚠️ Can't create the report room — give the bot 'Manage Channels'")
-        return
-    except discord.HTTPException as e:
-        print(f"❌ Failed to create report room: {e}")
-        return
+        # Queued duplicate events: by now the member is already in their room (or left) -> nothing to do.
+        if not _in_trigger():
+            return
 
-    report_room_ids.add(room.id)
-    try:
-        await member.move_to(room, reason="Moved into their report room")
-        print(f"✅ Report room created for {member}")
-        # Put the 📛 on right now - don't wait for the voice event (it can arrive late).
-        await asyncio.sleep(0.5)
-        await set_report_vc_alert(member)
-    except discord.Forbidden:
-        print("⚠️ Can't move the member — give the bot 'Move Members'")
-        await room.delete(reason="Couldn't move the member in")
-    except discord.HTTPException as e:
-        # Most likely the member already left the trigger channel.
-        print(f"⚠️ Couldn't move {member} into the report room: {e}")
-        await room.delete(reason="Member was no longer in voice")
+        room = None
+        created_new = False
+        existing_id = member_report_rooms.get(member.id)
+        existing = guild.get_channel(existing_id) if existing_id else None
+        if isinstance(existing, discord.VoiceChannel) and _is_report_room(existing):
+            room = existing  # reuse their room
+        else:
+            wait = REPORT_ROOM_COOLDOWN - (time.monotonic() - _report_last_created.get(member.id, 0.0))
+            if wait > 0:
+                await asyncio.sleep(wait)
+                if not _in_trigger():
+                    return
+
+            category = guild.get_channel(REPORT_CATEGORY_ID)
+            if not isinstance(category, discord.CategoryChannel):
+                print("⚠️ Couldn't find the REPORT category — check REPORT_CATEGORY_ID")
+                return
+            try:
+                room = await guild.create_voice_channel(
+                    REPORT_CHANNEL_NAME,
+                    category=category,
+                    overwrites=category.overwrites,
+                    reason=f"Report room for {member}",
+                )
+            except discord.Forbidden:
+                print("⚠️ Can't create the report room — give the bot 'Manage Channels'")
+                return
+            except discord.HTTPException as e:
+                print(f"❌ Failed to create report room: {e}")
+                return
+            created_new = True
+            report_room_ids.add(room.id)
+            member_report_rooms[member.id] = room.id
+            _report_last_created[member.id] = time.monotonic()
+
+        try:
+            await member.move_to(room, reason="Moved into their report room")
+            print(f"✅ Report room {'created' if created_new else 'reused'} for {member}")
+            # Put the 📛 on right now - don't wait for the voice event (it can arrive late).
+            await asyncio.sleep(0.5)
+            await set_report_vc_alert(member)
+        except discord.Forbidden:
+            print("⚠️ Can't move the member — give the bot 'Move Members'")
+            if created_new:
+                await room.delete(reason="Couldn't move the member in")
+        except discord.HTTPException as e:
+            # Most likely the member already left the trigger channel.
+            print(f"⚠️ Couldn't move {member} into the report room: {e}")
+            if created_new:
+                try:
+                    await room.delete(reason="Member was no longer in voice")
+                except discord.HTTPException:
+                    pass
 
 
 async def delete_if_empty_report_room(channel):
@@ -328,6 +379,9 @@ async def delete_if_empty_report_room(channel):
     try:
         await channel.delete(reason="Report room is empty")
         report_room_ids.discard(channel.id)
+        for mid, rid in list(member_report_rooms.items()):
+            if rid == channel.id:
+                del member_report_rooms[mid]
         print(f"🗑️ Deleted empty report room {channel.id}")
     except discord.HTTPException:
         pass
@@ -1226,7 +1280,32 @@ async def on_member_join(member: discord.Member):
         print(f"⚠️ Failed to read invites: {e}")
 
 
+async def find_latest_verification(channel: discord.TextChannel, member_id: int) -> discord.Message | None:
+    """Newest verification request the bot posted for this member (open or finished).
+    Used after a restart, when the in-memory cache is empty."""
+    try:
+        async for msg in channel.history(limit=100):
+            if msg.author.id != bot.user.id or not msg.embeds:
+                continue
+            ids = [
+                getattr(c, "custom_id", None) or ""
+                for row in msg.components for c in getattr(row, "children", [])
+            ]
+            if any(cid.startswith("verify_") and cid.endswith(f"_{member_id}") for cid in ids):
+                return msg
+    except (discord.Forbidden, discord.HTTPException) as e:
+        print(f"⚠️ Couldn't read the verification channel history: {e}")
+    return None
+
+
 async def send_verification_alert(member: discord.Member, voice_channel: discord.VoiceChannel):
+    """Anti-spam wrapper: one verification request at a time per member."""
+    lock = _verify_locks.setdefault(member.id, asyncio.Lock())
+    async with lock:
+        await _send_verification_alert(member, voice_channel)
+
+
+async def _send_verification_alert(member: discord.Member, voice_channel: discord.VoiceChannel):
     """Posts the 'awaiting verification' embed with Verify/Reject buttons."""
     # Only alert for members who have the Unverified role
     unverified_role = member.guild.get_role(UNVERIFIED_ROLE_ID)
@@ -1238,6 +1317,42 @@ async def send_verification_alert(member: discord.Member, voice_channel: discord
     if verification_channel is None:
         print("⚠️ Couldn't find the verification channel — check VERIFICATION_CHANNEL_ID")
         return
+
+    # ---------- anti-spam: has this member already got a request? ----------
+    existing = None
+    entry = verify_alerts.get(member.id)
+    if entry is not None:
+        try:
+            existing = await verification_channel.fetch_message(entry["message"].id)
+        except discord.NotFound:
+            existing = None
+            verify_alerts.pop(member.id, None)
+            entry = None
+        except discord.HTTPException:
+            existing = entry["message"]
+    if existing is None:
+        existing = await find_latest_verification(verification_channel, member.id)
+        if existing is not None:
+            entry = verify_alerts[member.id] = {"message": existing, "rejoins": 0, "last_edit": 0.0}
+
+    if existing is not None and existing.embeds:
+        if existing.embeds[0].footer.text == VERIFY_OPEN_FOOTER:
+            # Still open -> NEVER post another one. Just count the re-join on the existing request.
+            entry["rejoins"] = entry.get("rejoins", 0) + 1
+            print(f"⏭️ {member} re-joined, verification request already open (x{entry['rejoins']})")
+            if time.monotonic() - entry.get("last_edit", 0.0) >= 5:
+                try:
+                    embed = existing.embeds[0].copy()
+                    set_field(embed, "Re-joined the voice channel", f"`{entry['rejoins']}` time(s) since this request", inline=False)
+                    await existing.edit(embed=embed)
+                    entry["last_edit"] = time.monotonic()
+                except discord.HTTPException:
+                    pass
+            return
+        age = (discord.utils.utcnow() - existing.created_at).total_seconds()
+        if age < VERIFY_REALERT_COOLDOWN:
+            print(f"⏭️ {member} re-joined too soon after the last request was handled ({int(age)}s) — skipped")
+            return
 
     print(f"📤 Sending verification message for {member}")
 
@@ -1277,16 +1392,17 @@ async def send_verification_alert(member: discord.Member, voice_channel: discord
         color=PURPLE,
     )
     embed.set_thumbnail(url=member.display_avatar.url)
-    embed.set_footer(text="Click Verify to let this member in")
+    embed.set_footer(text=VERIFY_OPEN_FOOTER)
 
     try:
-        await send_with_retry(
+        sent = await send_with_retry(
             verification_channel,
             content="@everyone A member in the voice channel needs verification",
             embed=embed,
             view=verify_view(member.id),
             allowed_mentions=discord.AllowedMentions(everyone=True),
         )
+        verify_alerts[member.id] = {"message": sent, "rejoins": 0, "last_edit": 0.0}
         print(f"✅ Verification message sent for {member}")
     except Exception as e:
         print(f"❌ Failed to send verification message: {e}")
