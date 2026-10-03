@@ -16,19 +16,17 @@ How it works:
          Resolve               -> closes the request (popup for an optional note about the
                                   problem); the member panel updates by itself
      The voice channel name is a clickable link, so a mod can jump straight in.
-   - MEMBER PANEL: the bot posts a panel in the #describe-issue text channel and MENTIONS
-     the member in it, so they get a ping. The panel has a live Status
-         🟡 Waiting for a mod  ->  🟣 <mod> is handling your request
-         ->  🟢 Resolved  (or 🔴 left the queue / ⚪ cancelled)
-     plus "Describe Issue" and "Cancel Request" buttons.
-   - When the member presses "Describe Issue", their text is added to the mod alert
+   - MEMBER PANEL: there is ONE single panel in the #describe-issue text channel, shared by
+     everyone. It lists every member currently waiting (with their @mention and a live status:
+         🟡 Waiting for a moderator  ->  🟣 <mod> is handling your request).
+     When a member joins the help channel they are added to that same panel (and get a short
+     ping that deletes itself); when they leave, cancel or get resolved they disappear from it.
+     The panel's "Describe Issue" and "Cancel Request" buttons work for whoever pressed them.
+   - When a member presses "Describe Issue", their text is added to the mod alert
      (so mods see everything in ONE place) and also posted to ISSUE_REPORTS_CHANNEL_ID.
    - If the member leaves or cancels, the mod alert closes by itself.
      If the member is MOVED to another channel, the alert stays OPEN (status "Member moved")
      so a mod can still press Claim / Resolve and leave a note.
-   - A finished member panel (🟢 resolved / 🔴 left / ⚪ cancelled) stays in the channel with
-     its buttons switched off. Set PANEL_DELETE_AFTER to a number of seconds if you want
-     finished panels to delete themselves (None = never delete).
    - Each waiting-for-help channel has its own emoji shown in the alert title, and can
      independently turn the member-facing panel on or off (see HELP_VC_CONFIG below).
 3) When a member joins one of the "REPORT" voice channels:
@@ -52,8 +50,9 @@ Before running:
     - Give the bot the "Manage Nicknames" permission, and put the bot's role ABOVE the
       roles of the members it needs to rename (Discord never lets a bot rename the
       server owner, or anyone whose top role is higher than the bot's).
-    - Give the bot View Channel, Send Messages, Embed Links and Mention Everyone in the
-      #describe-issue channel, and let members see that channel.
+    - Give the bot View Channel, Send Messages, Embed Links, Mention Everyone,
+      Read Message History and Manage Messages in the #describe-issue channel, and let
+      members see that channel.
     - Set DISCORD_TOKEN as an environment variable (Railway > Variables).
 """
 
@@ -165,12 +164,17 @@ _nick_locks: dict[int, asyncio.Lock] = {}
 _nick_failed: set[int] = set()
 
 # help_panels[member_id] = {
-#     "message": member-facing panel message (or None if the panel is turned off),
 #     "alert": the mod alert message,
 #     "described": bool, "claimed": bool,
+#     "show": listed on the shared panel?, "status": text shown next to them, "joined_at": datetime,
 # }
-# Lets the two panels stay in sync with each other (claim / resolve / leave / cancel).
+# An entry here means "this member has an ACTIVE request": it is what the shared panel lists
+# and what stops a second alert from ever being sent for the same member.
 help_panels = {}
+
+# The ONE shared member panel in #describe-issue (a single message for everyone).
+shared_panel: discord.Message | None = None
+_panel_lock = asyncio.Lock()
 
 _startup_sync_done = False  # on_ready can fire many times (reconnects) - only sync nicknames once
 
@@ -186,10 +190,12 @@ ALERT_STATUS = {
     "Member moved": "🔵 `Member moved`",
 }
 
-# Finished member panels (resolved / left / cancelled) can delete themselves after this many
-# seconds. None = never delete: the panel just stays in the channel with its buttons switched off.
-# Example: PANEL_DELETE_AFTER = 10 * 60 deletes each finished panel after 10 minutes.
-PANEL_DELETE_AFTER: int | None = None
+# When a member joins the help channel, the bot sends a short message that @mentions them
+# (so they get a notification) and deletes it again after PING_DELETE_AFTER seconds.
+# Edits to the shared panel never notify anyone, which is why this tiny ping exists.
+# Set PING_ON_JOIN = False if you only want the mention inside the panel.
+PING_ON_JOIN = True
+PING_DELETE_AFTER = 5
 # Custom emoji (paste the IDs of other emoji here if you ever change them).
 # If one of them is an ANIMATED emoji, change "<:" to "<a:" / animated=False to animated=True.
 SUPPORT_TITLE_EMOJI = "<:support:1555003977173573684>"   # shown in front of the panel title
@@ -197,27 +203,6 @@ CANCEL_EMOJI = discord.PartialEmoji(name="cancel", id=1554671367142645770, anima
 PANEL_TITLE = f"{SUPPORT_TITLE_EMOJI} Support Request Received"
 PURPLE = discord.Color.purple()  # the colour of EVERY embed - change it here to recolour all panels at once
 _bg_tasks: set = set()
-
-
-async def delete_later(message: discord.Message, delay: float):
-    """Waits, then deletes the message (quietly ignores it if it's already gone)."""
-    await asyncio.sleep(max(delay, 0))
-    try:
-        await message.delete()
-        print(f"🗑️ Deleted finished member panel {message.id}")
-    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-        pass
-
-
-def schedule_delete(message: discord.Message, delay: float | None = None):
-    """Deletes a finished member panel later. Does nothing when PANEL_DELETE_AFTER is None."""
-    if delay is None:
-        delay = PANEL_DELETE_AFTER
-    if delay is None:
-        return
-    task = asyncio.create_task(delete_later(message, delay))
-    _bg_tasks.add(task)  # keep a reference so the task is never garbage-collected
-    task.add_done_callback(_bg_tasks.discard)
 
 
 async def cache_invites(guild: discord.Guild):
@@ -624,7 +609,7 @@ async def resolve_alert(interaction: discord.Interaction, member_id: int, note: 
         member_id,
         f"🟢 Resolved by {interaction.user.mention}",
         PURPLE,
-        note="## All done\nA **mod** has handled your request.\n*Thanks for your patience.*",
+        note="## All done\nA **moderator** has handled your request.\n*Thank you for your patience.*",
     )
 
 
@@ -716,7 +701,7 @@ class HelpButton(
                 self.member_id,
                 f"🟣 {interaction.user.mention} is handling your request",
                 PURPLE,
-                note="## A mod is on it\nSomeone picked up your request and will be with you in a moment.",
+                note="## A moderator is on it\nSomeone has picked up your request and will be with you in a moment.\n*Please stay in the voice channel.*",
             )
 
 
@@ -749,41 +734,121 @@ class IssueReportView(discord.ui.View):
         await interaction.response.edit_message(embed=embed, view=IssueReportView(seen=True))
 
 
-# ====================== MEMBER panel ======================
-def build_finished_embed(embed: discord.Embed, status: str, color: discord.Color, note: str | None) -> discord.Embed:
-    """Copy of the member panel in its final state (final status, final message)."""
-    embed = embed.copy()
-    embed.color = color
-    embed.set_field_at(0, name="Status", value=status, inline=True)
-    if note:
-        embed.description = note
-    icon = embed.footer.icon_url if embed.footer else None
-    footer = "ELITE LEADERS COMMUNITY • Support System"
-    if PANEL_DELETE_AFTER is not None:
-        minutes = max(round(PANEL_DELETE_AFTER / 60), 1)
-        footer += f" • This message will be deleted in {minutes} minute{'s' if minutes != 1 else ''}"
-    embed.set_footer(text=footer, icon_url=icon)
+# ====================== MEMBER panel (ONE shared panel for everyone) ======================
+def build_shared_embed(guild: discord.Guild) -> discord.Embed:
+    """The single panel in #describe-issue. It lists everyone currently waiting for a moderator."""
+    queue = sorted(
+        ((mid, e) for mid, e in help_panels.items() if e.get("show")),
+        key=lambda item: item[1]["joined_at"],
+    )
+    if queue:
+        lines = [
+            f"**{i}.** <@{mid}> — {e['status']} • {discord.utils.format_dt(e['joined_at'], 'R')}"
+            for i, (mid, e) in enumerate(queue[:15], start=1)
+        ]
+        if len(queue) > 15:
+            lines.append(f"*…and {len(queue) - 15} more*")
+        queue_text = "\n".join(lines)
+    else:
+        queue_text = "*Nobody is waiting right now.*"
+
+    embed = discord.Embed(
+        title=PANEL_TITLE,
+        description=(
+            "## Moderator Support\n"
+            "Need help from a **moderator**? Join the **Waiting for Help** voice channel and you will "
+            "be added to the queue below automatically. A moderator will join you as soon as one is available.\n"
+            "\n"
+            "### How it works\n"
+            "**1.** Join the voice channel and stay in it, so we can find you.\n"
+            "**2.** Press **Describe Issue** and tell us what happened, who is involved and when it happened.\n"
+            "**3.** Press **Cancel Request** if you no longer need help.\n"
+            "\n"
+            "### Current queue\n"
+            f"{queue_text}"
+        ),
+        color=PURPLE,
+    )
+    embed.set_footer(
+        text="ELITE LEADERS COMMUNITY • Support System",
+        icon_url=guild.icon.url if guild.icon else None,
+    )
+    embed.timestamp = discord.utils.utcnow()
     return embed
 
 
-async def set_panel_status(member_id: int, status: str, color: discord.Color, note: str | None = None):
-    """Changes the Status line (and optionally the message) on the member's panel
-    but keeps its buttons working."""
-    entry = help_panels.get(member_id)
-    if entry is None or entry.get("message") is None:
+async def refresh_shared_panel(guild: discord.Guild):
+    """Edits the ONE shared panel (or creates it if it doesn't exist / was deleted)."""
+    global shared_panel
+    channel = guild.get_channel(MEMBER_HELP_PANEL_CHANNEL_ID)
+    if not isinstance(channel, discord.TextChannel):
+        print("⚠️ Couldn't find the #describe-issue channel — check MEMBER_HELP_PANEL_CHANNEL_ID")
         return
+    async with _panel_lock:
+        embed = build_shared_embed(guild)
+        if shared_panel is not None:
+            try:
+                await shared_panel.edit(embed=embed, view=panel_view())
+                return
+            except discord.NotFound:
+                shared_panel = None  # someone deleted it -> send a new one below
+            except discord.HTTPException as e:
+                print(f"⚠️ Failed to update the shared panel: {e}")
+                return
+        try:
+            shared_panel = await send_with_retry(channel, embed=embed, view=panel_view())
+            print("✅ Shared support panel sent")
+        except Exception as e:
+            print(f"❌ Failed to send the shared panel: {e}")
+
+
+async def ensure_shared_panel(guild: discord.Guild):
+    """On startup: reuse the newest panel already in the channel and delete any extra/old ones,
+    so there is exactly ONE panel."""
+    global shared_panel
+    channel = guild.get_channel(MEMBER_HELP_PANEL_CHANNEL_ID)
+    if not isinstance(channel, discord.TextChannel):
+        return
+    found = []
     try:
-        message = entry["message"]
-        embed = message.embeds[0].copy()
-        embed.color = color
-        embed.set_field_at(0, name="Status", value=status, inline=True)
-        if note:
-            embed.description = note
-        await message.edit(embed=embed, view=panel_view(member_id))
-    except discord.NotFound:
+        async for msg in channel.history(limit=100):
+            if msg.author.id == bot.user.id and msg.embeds and "Support Request Received" in (msg.embeds[0].title or ""):
+                found.append(msg)  # newest first
+    except (discord.Forbidden, discord.HTTPException) as e:
+        print(f"⚠️ Couldn't read #describe-issue history (needs 'Read Message History'): {e}")
+    if found:
+        shared_panel = found[0]
+        for old in found[1:]:
+            try:
+                await old.delete()
+            except discord.HTTPException:
+                pass
+    await refresh_shared_panel(guild)
+
+
+async def ping_member(channel: discord.TextChannel, member: discord.Member):
+    """Short @mention message so the member gets a notification; it deletes itself."""
+    try:
+        msg = await channel.send(
+            f"{member.mention} your request is in — check the panel.",
+            allowed_mentions=discord.AllowedMentions(users=[member]),
+        )
+        await asyncio.sleep(PING_DELETE_AFTER)
+        await msg.delete()
+    except discord.HTTPException:
         pass
-    except discord.HTTPException as e:
-        print(f"⚠️ Failed to update member panel status: {e}")
+
+
+async def set_panel_status(member_id: int, status: str, color: discord.Color | None = None, note: str | None = None):
+    """Changes the member's status line in the shared panel (color / note are kept only so old
+    calls still work)."""
+    entry = help_panels.get(member_id)
+    if entry is None:
+        return
+    entry["status"] = status
+    guild = bot.get_guild(GUILD_ID)
+    if guild:
+        await refresh_shared_panel(guild)
 
 
 async def close_help_request(
@@ -795,9 +860,9 @@ async def close_help_request(
     note: str | None = None,
     lock_alert: bool = True,
 ):
-    """Finishes a help request: the member panel gets its final look and its buttons are
-    disabled (and it is deleted later only if PANEL_DELETE_AFTER is set). If `alert_footer`
+    """Finishes a help request: the member is removed from the shared panel. If `alert_footer`
     is given, the mod alert is updated too (used when the member leaves, cancels, or gets moved).
+    (status / color / note / skip_panel are only kept so older calls still work.)
 
     lock_alert=True  -> the alert's buttons are disabled (request is over).
     lock_alert=False -> the alert only gets its new Status; Claim / Resolve stay pressable
@@ -805,18 +870,6 @@ async def close_help_request(
     entry = help_panels.pop(member_id, None)
     if entry is None:
         return
-
-    panel = entry.get("message")
-    if panel is not None and not skip_panel:
-        try:
-            embed = build_finished_embed(panel.embeds[0], status, color, note)
-            await panel.edit(embed=embed, view=panel_view(member_id, disabled=True))
-            schedule_delete(panel)
-        except discord.NotFound:
-            pass
-        except discord.HTTPException as e:
-            print(f"⚠️ Failed to update member panel: {e}")
-            schedule_delete(panel)
 
     alert = entry.get("alert")
     if alert_footer and alert is not None:
@@ -837,6 +890,11 @@ async def close_help_request(
         except discord.HTTPException as e:
             print(f"⚠️ Failed to update mod alert: {e}")
 
+    # Take the member off the shared panel.
+    guild = bot.get_guild(GUILD_ID)
+    if guild:
+        await refresh_shared_panel(guild)
+
 
 class DescribeIssueModal(discord.ui.Modal, title="Describe Your Issue"):
     issue = discord.ui.TextInput(
@@ -855,7 +913,7 @@ class DescribeIssueModal(discord.ui.Modal, title="Describe Your Issue"):
         # Answer the member first so the popup never times out, then do the rest.
         # Ephemeral - only the member who submitted it sees this confirmation.
         await interaction.response.send_message(
-            "Got it, thanks. Your message has been sent to the mods and one of them will be with you shortly.",
+            "Got it, thanks. Your message has been sent to the moderators and one of them will be with you shortly.",
             ephemeral=True,
         )
 
@@ -880,9 +938,9 @@ class DescribeIssueModal(discord.ui.Modal, title="Describe Your Issue"):
             if not entry.get("claimed"):
                 await set_panel_status(
                     self.member_id,
-                    "🟡 Message sent — waiting for a mod",
+                    "🟡 Message sent — waiting for a moderator",
                     PURPLE,
-                    note="## Message received\nYour message reached the **mods**.\n*One of them will read it and be with you shortly.*",
+                    note="## Message received\nYour message has reached the **moderators**.\n*One of them will read it and be with you shortly. Please stay in the voice channel.*",
                 )
 
         # 2) Also post it to the issue reports channel (kept from before).
@@ -937,11 +995,11 @@ class DescribeIssueModal(discord.ui.Modal, title="Describe Your Issue"):
 
 class MemberPanelButton(
     discord.ui.DynamicItem[discord.ui.Button],
-    template=r"member_(?P<action>describe|cancel)_(?P<uid>[0-9]+)",
+    template=r"member_(?P<action>describe|cancel)(?:_[0-9]+)?",
 ):
-    """Buttons on the panel shown to the member themselves while they wait for a mod."""
+    """Buttons on the ONE shared panel. They act for whoever pressed them."""
 
-    def __init__(self, action: str, member_id: int, disabled: bool = False):
+    def __init__(self, action: str):
         if action == "describe":
             label, emoji = "Describe Issue", None
         else:
@@ -951,52 +1009,48 @@ class MemberPanelButton(
                 label=label,
                 emoji=emoji,
                 style=discord.ButtonStyle.secondary,  # grey
-                custom_id=f"member_{action}_{member_id}",
-                disabled=disabled,
+                custom_id=f"member_{action}",
             )
         )
         self.action = action
-        self.member_id = member_id
 
     @classmethod
     async def from_custom_id(cls, interaction: discord.Interaction, item: discord.ui.Button, match, /):
-        return cls(match["action"], int(match["uid"]))
+        return cls(match["action"])
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.member_id:
-            await interaction.response.send_message("This panel isn't for you.", ephemeral=True)
+        entry = help_panels.get(interaction.user.id)
+        if entry is None or not entry.get("show"):
+            await interaction.response.send_message(
+                "You don't have an active request. Join the **Waiting for Help** voice channel and you will be added to this panel.",
+                ephemeral=True,
+            )
             return False
         return True
 
     async def callback(self, interaction: discord.Interaction):
+        member_id = interaction.user.id
         if self.action == "describe":
-            await interaction.response.send_modal(DescribeIssueModal(self.member_id))
+            await interaction.response.send_modal(DescribeIssueModal(member_id))
             return
 
-        cancel_note = "## Request cancelled\nNo problem. Join the help channel again any time you need a **mod**."
-        embed = build_finished_embed(
-            interaction.message.embeds[0],
-            "⚪ You cancelled this request",
-            PURPLE,
-            cancel_note,
+        await interaction.response.send_message(
+            "Your request has been cancelled. Join the help channel again any time you need a **moderator**.",
+            ephemeral=True,
         )
-        await interaction.response.edit_message(embed=embed, view=panel_view(self.member_id, disabled=True))
-        schedule_delete(interaction.message)  # only does something if PANEL_DELETE_AFTER is set
-
         # Close the mod alert too, so nobody chases a request that was cancelled.
         await close_help_request(
-            self.member_id,
-            "⚪ You cancelled this request",
+            member_id,
+            "⚪ Cancelled",
             PURPLE,
             alert_footer="Cancelled",
-            skip_panel=True,  # already edited + scheduled above
         )
 
 
-def panel_view(member_id: int, disabled: bool = False) -> discord.ui.View:
+def panel_view() -> discord.ui.View:
     view = discord.ui.View(timeout=None)
-    view.add_item(MemberPanelButton("describe", member_id, disabled))
-    view.add_item(MemberPanelButton("cancel", member_id, disabled))
+    view.add_item(MemberPanelButton("describe"))
+    view.add_item(MemberPanelButton("cancel"))
     return view
 
 
@@ -1034,32 +1088,6 @@ async def nickname_watchdog():
         except Exception as e:
             print(f"⚠️ Nickname watchdog error: {e}")
         await asyncio.sleep(15)
-
-
-async def cleanup_finished_panels(guild: discord.Guild):
-    """After a restart: finished member panels (all buttons disabled) that were waiting to be
-    deleted get deleted now if their time is up, or re-scheduled for the time left.
-    Does nothing when PANEL_DELETE_AFTER is None (panels are kept)."""
-    if PANEL_DELETE_AFTER is None:
-        return
-    channel = guild.get_channel(MEMBER_HELP_PANEL_CHANNEL_ID)
-    if not isinstance(channel, discord.TextChannel):
-        return
-    now = discord.utils.utcnow()
-    try:
-        async for msg in channel.history(limit=100):
-            if msg.author.id != bot.user.id or not msg.embeds:
-                continue
-            if "Support Request Received" not in (msg.embeds[0].title or ""):
-                continue
-            buttons = [c for row in msg.components for c in getattr(row, "children", [])]
-            if not buttons or not all(getattr(c, "disabled", False) for c in buttons):
-                continue  # still active
-            finished_at = msg.edited_at or msg.created_at
-            remaining = PANEL_DELETE_AFTER - (now - finished_at).total_seconds()
-            schedule_delete(msg, remaining)
-    except (discord.Forbidden, discord.HTTPException) as e:
-        print(f"⚠️ Couldn't clean up old member panels (needs 'Read Message History'): {e}")
 
 
 @bot.event
@@ -1118,8 +1146,8 @@ async def on_ready():
         if _strip_alert_prefix(m.nick)[1]:
             await set_report_vc_alert(m)  # not in an alert VC -> restores the original nickname
 
-    # Finished member panels left over from before a restart (only if auto-delete is turned on)
-    await cleanup_finished_panels(guild)
+    # Make sure there is exactly ONE shared panel in #describe-issue (deletes old extra ones).
+    await ensure_shared_panel(guild)
 
 
 @bot.event
@@ -1266,11 +1294,25 @@ async def send_verification_alert(member: discord.Member, voice_channel: discord
 
 async def send_help_alert(member: discord.Member, voice_channel: discord.VoiceChannel, config: dict):
     """Posts the mod panel (alert + Claim / Resolve buttons) and, if turned on for this
-    channel, the member panel in #describe-issue. `config` is this VC's entry from HELP_VC_CONFIG."""
+    channel, adds the member to the shared panel in #describe-issue. `config` is this VC's entry from HELP_VC_CONFIG."""
     help_channel = member.guild.get_channel(HELP_ALERT_CHANNEL_ID)
     if help_channel is None:
         print("⚠️ Couldn't find the help alert channel — check HELP_ALERT_CHANNEL_ID")
         return
+
+    # Already has an active request -> never send a second panel / alert.
+    if member.id in help_panels:
+        print(f"⏭️ {member} already has an active help request, skipping")
+        return
+    # Reserve the slot NOW so a second voice event can't slip in while we await below.
+    help_panels[member.id] = {
+        "alert": None,
+        "described": False,
+        "claimed": False,
+        "show": config.get("send_member_panel", True),  # listed on the shared panel?
+        "status": "🟡 Waiting for a moderator",
+        "joined_at": discord.utils.utcnow(),
+    }
 
     emoji = config.get("emoji", "")
     print(f"📤 Sending help alert for {member} ({emoji})")
@@ -1279,7 +1321,7 @@ async def send_help_alert(member: discord.Member, voice_channel: discord.VoiceCh
     embed = discord.Embed(
         title=f"{emoji} Help Request".strip(),
         description=(
-            f"## {member.mention} needs a mod\n"
+            f"## {member.mention} needs a moderator\n"
             f"Waiting in {voice_channel.mention} — *join them to help.*"
         ),
         color=PURPLE,
@@ -1306,7 +1348,7 @@ async def send_help_alert(member: discord.Member, voice_channel: discord.VoiceCh
     try:
         alert_message = await send_with_retry(
             help_channel,
-            content="@everyone A member needs a mod",
+            content="@everyone A member needs a moderator",
             embed=embed,
             view=help_view(member.id),
             allowed_mentions=discord.AllowedMentions(everyone=True),
@@ -1315,59 +1357,33 @@ async def send_help_alert(member: discord.Member, voice_channel: discord.VoiceCh
     except Exception as e:
         print(f"❌ Failed to send help alert: {e}")
 
-    # Track this request so the two panels can update each other.
-    help_panels[member.id] = {
-        "message": None,
-        "alert": alert_message,
-        "described": False,
-        "claimed": False,
-    }
-
-    if not config.get("send_member_panel", True):
-        # Member panel turned off for this channel — mod alert only.
+    # Track this request so the mod alert and the shared panel can update each other.
+    entry = help_panels.get(member.id)
+    if entry is None:
+        # The member already left while the alert was being sent -> close the alert right away.
+        if alert_message is not None:
+            try:
+                left = alert_message.embeds[0].copy()
+                set_field(left, "Status", ALERT_STATUS["Member left"], inline=True)
+                left.set_footer(text="Member left", icon_url=left.footer.icon_url)
+                await alert_message.edit(embed=left, view=help_view(member.id, disabled=True))
+            except discord.HTTPException:
+                pass
         return
+    entry["alert"] = alert_message
 
-    # ---------------- MEMBER panel (posted in #describe-issue, with an @mention) ----------------
-    member_panel_channel = member.guild.get_channel(MEMBER_HELP_PANEL_CHANNEL_ID)
-    if member_panel_channel is None:
-        print("⚠️ Couldn't find the #describe-issue channel — check MEMBER_HELP_PANEL_CHANNEL_ID")
-        return
+    if not entry.get("show"):
+        return  # shared panel turned off for this channel — mod alert only
 
-    member_embed = discord.Embed(
-        title=PANEL_TITLE,
-        description=(
-            f"## Hey {member.mention}, you're in the queue\n"
-            "A **mod** has been notified and will join you as soon as they can. "
-            "Stay in the voice channel.\n"
-            "\n"
-            "**While you wait**, press **Describe Issue** and tell us what happened, "
-            "so the mod knows what's going on before they get to you.\n"
-            "Sorted it out already? Press **Cancel Request**."
-        ),
-        color=PURPLE,
-    )
-    member_embed.set_thumbnail(url=member.display_avatar.url)
-    member_embed.add_field(name="Status", value="🟡 Waiting for a mod", inline=True)
-    member_embed.add_field(name="Requested", value=discord.utils.format_dt(discord.utils.utcnow(), "R"), inline=True)
-    member_embed.add_field(name="Waiting In", value=voice_channel.mention, inline=True)
-    member_embed.set_footer(
-        text="ELITE LEADERS COMMUNITY • Support System",
-        icon_url=member.guild.icon.url if member.guild.icon else None,
-    )
-    member_embed.timestamp = discord.utils.utcnow()
+    # Add the member to the ONE shared panel (their @mention is listed inside it).
+    await refresh_shared_panel(member.guild)
 
-    try:
-        panel_message = await send_with_retry(
-            member_panel_channel,
-            content=f"{member.mention} your help request is in. Press **Describe Issue** below to tell the mods what happened.",
-            embed=member_embed,
-            view=panel_view(member.id),
-            allowed_mentions=discord.AllowedMentions(users=[member]),
-        )
-        print(f"✅ Member panel sent for {member}")
-        help_panels[member.id]["message"] = panel_message
-    except Exception as e:
-        print(f"❌ Failed to send member panel: {e}")
+    if PING_ON_JOIN:
+        ping_channel = member.guild.get_channel(MEMBER_HELP_PANEL_CHANNEL_ID)
+        if isinstance(ping_channel, discord.TextChannel):
+            task = asyncio.create_task(ping_member(ping_channel, member))
+            _bg_tasks.add(task)
+            task.add_done_callback(_bg_tasks.discard)
 
 
 @bot.event
@@ -1385,7 +1401,7 @@ async def on_voice_state_update(
         * sends the verification alert
     - Help VC:
         * adds ⏳ to the member's nickname
-        * sends the mod alert / member panel
+        * sends the mod alert and adds the member to the ONE shared panel
     - Report VCs:
         * adds 📛 to the member's nickname
     - When a member leaves these VCs:
@@ -1414,7 +1430,7 @@ async def on_voice_state_update(
                 "🔴 You left the queue",
                 PURPLE,
                 alert_footer="Member left",
-                note="## You left the queue\nThis request is closed. Join the help channel again any time you need a **mod**.",
+                note="## You left the queue\nThis request is closed. Join the help channel again any time you need a **moderator**.",
             )
         elif after_id != before_id:
             # Moved to another channel -> the member panel finishes, but the mod
@@ -1422,11 +1438,11 @@ async def on_voice_state_update(
             # and a note can be left.
             await close_help_request(
                 member.id,
-                "🟢 Resolved — a mod moved you",
+                "🟢 Resolved — a moderator moved you",
                 PURPLE,
                 alert_footer="Member moved",
                 lock_alert=False,
-                note="## All done\nA **mod** moved you, so this request is finished.\n*Thanks for your patience.*",
+                note="## All done\nA **moderator** moved you, so this request is finished.\n*Thank you for your patience.*",
             )
 
     # Nickname emoji: start it right away as its own task so it runs at the same time as
