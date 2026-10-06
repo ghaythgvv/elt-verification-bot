@@ -1,6 +1,16 @@
 """
-Discord Verification Bot  (v2)
+Discord Verification Bot  (v2.1)
 =======================================
+What's new in v2.1 (verification alerts in #verify):
+    - New, cleaner verification card (member, ID, account age, joined, invited by, voice channel, status).
+    - Reject now asks the moderator for a REASON (pop-up). The reason is written on the card and the
+      member gets a DM with it (DM_ON_REJECT).
+    - Rejoin spam control: while a request is open, rejoining only updates a counter on the same card.
+      A short "still waiting" reminder ping is sent at most once every 5 minutes (REJOIN_PING_COOLDOWN).
+    - A rejected member who comes back gets a new card that shows the previous rejection reason.
+    - If the member leaves the server while their request is open, the card is closed ("Member left").
+    - Inviter is always readable (mention + username), even if the inviter left the server.
+
 What's new in v2 (support panel in #describe-issue):
     - ANYONE can press "Describe Issue" in #describe-issue - no voice channel needed.
     - A member is added to "Current queue" when they SEND their issue (not when they join a voice channel).
@@ -92,9 +102,15 @@ NEW_ACCOUNT_WARNING_DAYS = 7
 WARN_EMOJI = "<:warn_purple:1554671365490212945>"
 
 # Anti-spam
-VERIFY_REALERT_COOLDOWN = 5 * 60
+VERIFY_REALERT_COOLDOWN = 5 * 60   # after a request was handled, a new card is only sent after this
+REJOIN_PING_COOLDOWN = 5 * 60      # while a request is open: "still waiting" reminder at most this often
+REMINDER_DELETE_AFTER = 10 * 60    # the reminder ping cleans itself up after this many seconds
 HELP_LEAVE_GRACE = 20
 REPORT_ROOM_COOLDOWN = 10
+
+# Rejecting
+DM_ON_REJECT = True                # DM the member the reason when a moderator rejects them
+REJECT_REASON_MAX = 300
 # ================================================================
 
 intents = discord.Intents.default()
@@ -126,6 +142,7 @@ _report_locks: dict[int, asyncio.Lock] = {}
 _report_last_created: dict[int, float] = {}
 _leave_tasks: dict[int, asyncio.Task] = {}
 VERIFY_OPEN_FOOTER = "Click Verify to let this member in"
+VERIFY_DONE_FOOTERS = ("Verified ☑️", "Verified ✅", "Rejected ❌", "Member left ❌")
 
 shared_panel: discord.Message | None = None
 _panel_lock = asyncio.Lock()
@@ -408,6 +425,75 @@ def _already_done(message: discord.Message, done_footers: tuple[str, ...]) -> bo
     return bool(message.embeds and message.embeds[0].footer.text in done_footers)
 
 
+async def dm_rejected_member(guild: discord.Guild, member_id: int, reason: str) -> bool:
+    """DMs the rejected member the reason. Returns True if the DM went through."""
+    member = guild.get_member(member_id)
+    if member is None:
+        return False
+    embed = discord.Embed(
+        title="Your verification was not accepted",
+        description=f"A moderator reviewed your request in **{guild.name}** and could not verify you right now.",
+        color=PURPLE,
+    )
+    embed.add_field(name="Reason", value=f">>> {reason}"[:1024], inline=False)
+    embed.set_footer(text=guild.name, icon_url=guild.icon.url if guild.icon else None)
+    embed.timestamp = discord.utils.utcnow()
+    try:
+        await member.send(embed=embed)
+        return True
+    except (discord.Forbidden, discord.HTTPException):
+        return False
+
+
+class RejectReasonModal(discord.ui.Modal, title="Reject Member"):
+    reason = discord.ui.TextInput(
+        label="Why is this member being rejected?",
+        style=discord.TextStyle.paragraph,
+        placeholder="The reason is shown on the card and sent to the member.",
+        required=True,
+        max_length=REJECT_REASON_MAX,
+    )
+
+    def __init__(self, member_id: int):
+        super().__init__()
+        self.member_id = member_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        message = interaction.message
+        if message is None or not message.embeds:
+            return await interaction.response.send_message("Couldn't find the request message.", ephemeral=True)
+        if _already_done(message, VERIFY_DONE_FOOTERS):
+            return await interaction.response.send_message("This request was already handled.", ephemeral=True)
+
+        reason = self.reason.value.strip()
+        embed = message.embeds[0].copy()
+        embed.color = PURPLE
+        set_field(embed, "Status", "🔴 `Rejected`", inline=True)
+        set_field(
+            embed, "Rejected by",
+            f"❌ {interaction.user.mention} • {discord.utils.format_dt(discord.utils.utcnow(), 'R')}",
+            inline=False,
+        )
+        set_field(embed, "Reason", f">>> {reason}"[:1024], inline=False)
+        embed.set_footer(text="Rejected ❌")
+        await interaction.response.edit_message(embed=embed, view=verify_view(self.member_id, disabled=True))
+
+        notified = False
+        if DM_ON_REJECT and interaction.guild is not None:
+            notified = await dm_rejected_member(interaction.guild, self.member_id, reason)
+        if DM_ON_REJECT:
+            await interaction.followup.send(
+                "Rejected. The member was sent the reason by DM." if notified
+                else "Rejected. I couldn't DM the member (their DMs are closed or they left).",
+                ephemeral=True,
+            )
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        print(f"❌ Reject modal error: {error}")
+        if not interaction.response.is_done():
+            await interaction.response.send_message("Something went wrong. Please try again.", ephemeral=True)
+
+
 class VerifyButton(
     discord.ui.DynamicItem[discord.ui.Button],
     template=r"verify_(?P<action>accept|reject)_(?P<uid>[0-9]+)",
@@ -433,67 +519,72 @@ class VerifyButton(
         return cls(match["action"], int(match["uid"]))
 
     async def callback(self, interaction: discord.Interaction):
+        # Reject: ask for the reason first (the pop-up must be the first response).
+        if self.action == "reject":
+            if _already_done(interaction.message, VERIFY_DONE_FOOTERS):
+                return await interaction.response.send_message("This request was already handled.", ephemeral=True)
+            return await interaction.response.send_modal(RejectReasonModal(self.member_id))
+
         await interaction.response.defer()
 
-        if _already_done(interaction.message, ("Verified ☑️", "Verified ✅", "Rejected ❌")):
+        if _already_done(interaction.message, VERIFY_DONE_FOOTERS):
             return await interaction.followup.send("This request was already handled.", ephemeral=True)
 
         embed = interaction.message.embeds[0].copy()
 
-        if self.action == "accept":
-            guild = interaction.guild
-            member = guild.get_member(self.member_id)
-            if member is None:
-                try:
-                    member = await guild.fetch_member(self.member_id)
-                except discord.HTTPException:
-                    member = None
-            if member is None:
-                return await interaction.followup.send(
-                    "That member isn't in the server anymore (they may have left).", ephemeral=True
-                )
-
-            unverified_role = guild.get_role(UNVERIFIED_ROLE_ID)
-            verified_role = guild.get_role(VERIFIED_ROLE_ID)
-
+        guild = interaction.guild
+        member = guild.get_member(self.member_id)
+        if member is None:
             try:
-                if unverified_role and unverified_role in member.roles:
-                    await member.remove_roles(unverified_role, reason=f"Verified by {interaction.user}")
-                if verified_role:
-                    await member.add_roles(verified_role, reason=f"Verified by {interaction.user}")
-                for rid in EXTRA_ROLES_ON_VERIFY:
-                    r = guild.get_role(rid)
-                    if r:
-                        await member.add_roles(r, reason="Extra role after verification")
-            except discord.Forbidden:
-                return await interaction.followup.send(
-                    "The bot doesn't have enough permission to change roles (make sure the bot's role is above the roles it manages).",
-                    ephemeral=True,
-                )
-            except discord.HTTPException as e:
-                print(f"❌ Failed to change roles for {member}: {e}")
-                return await interaction.followup.send("Something went wrong while changing roles. Try again.", ephemeral=True)
+                member = await guild.fetch_member(self.member_id)
+            except discord.HTTPException:
+                member = None
+        if member is None:
+            return await interaction.followup.send(
+                "That member isn't in the server anymore (they may have left).", ephemeral=True
+            )
 
-            embed.color = PURPLE
-            embed.add_field(name="Verified", value=f"☑️ {interaction.user.mention}", inline=False)
-            embed.set_footer(text="Verified ☑️")
-            member_inviters.pop(self.member_id, None)
-            await interaction.edit_original_response(embed=embed, view=verify_view(self.member_id, disabled=True))
+        unverified_role = guild.get_role(UNVERIFIED_ROLE_ID)
+        verified_role = guild.get_role(VERIFIED_ROLE_ID)
 
-            if WELCOME_CHANNEL_ID:
-                welcome_channel = guild.get_channel(WELCOME_CHANNEL_ID)
-                if welcome_channel:
-                    try:
-                        await welcome_channel.send(
-                            f"🎉 Welcome {member.mention}, you're verified — glad to have you in the server!"
-                        )
-                    except discord.HTTPException as e:
-                        print(f"⚠️ Couldn't send welcome message: {e}")
-        else:
-            embed.color = PURPLE
-            embed.add_field(name="Rejected", value=f"❌ {interaction.user.mention}", inline=False)
-            embed.set_footer(text="Rejected ❌")
-            await interaction.edit_original_response(embed=embed, view=verify_view(self.member_id, disabled=True))
+        try:
+            if unverified_role and unverified_role in member.roles:
+                await member.remove_roles(unverified_role, reason=f"Verified by {interaction.user}")
+            if verified_role:
+                await member.add_roles(verified_role, reason=f"Verified by {interaction.user}")
+            for rid in EXTRA_ROLES_ON_VERIFY:
+                r = guild.get_role(rid)
+                if r:
+                    await member.add_roles(r, reason="Extra role after verification")
+        except discord.Forbidden:
+            return await interaction.followup.send(
+                "The bot doesn't have enough permission to change roles (make sure the bot's role is above the roles it manages).",
+                ephemeral=True,
+            )
+        except discord.HTTPException as e:
+            print(f"❌ Failed to change roles for {member}: {e}")
+            return await interaction.followup.send("Something went wrong while changing roles. Try again.", ephemeral=True)
+
+        embed.color = PURPLE
+        set_field(embed, "Status", "🟢 `Verified`", inline=True)
+        set_field(
+            embed, "Verified by",
+            f"☑️ {interaction.user.mention} • {discord.utils.format_dt(discord.utils.utcnow(), 'R')}",
+            inline=False,
+        )
+        embed.set_footer(text="Verified ☑️")
+        member_inviters.pop(self.member_id, None)
+        await interaction.edit_original_response(embed=embed, view=verify_view(self.member_id, disabled=True))
+
+        if WELCOME_CHANNEL_ID:
+            welcome_channel = guild.get_channel(WELCOME_CHANNEL_ID)
+            if welcome_channel:
+                try:
+                    await welcome_channel.send(
+                        f"🎉 Welcome {member.mention}, you're verified — glad to have you in the server!"
+                    )
+                except discord.HTTPException as e:
+                    print(f"⚠️ Couldn't send welcome message: {e}")
 
 
 def verify_view(member_id: int, disabled: bool = False) -> discord.ui.View:
@@ -1287,6 +1378,36 @@ async def on_member_join(member: discord.Member):
         print(f"⚠️ Failed to read invites: {e}")
 
 
+@bot.event
+async def on_member_remove(member: discord.Member):
+    """If the member leaves the server while their verification card is still open, close the card."""
+    if member.guild.id != GUILD_ID or member.bot:
+        return
+
+    entry = verify_alerts.get(member.id)
+    msg = entry["message"] if entry else None
+    if msg is None:
+        channel = member.guild.get_channel(VERIFICATION_CHANNEL_ID)
+        if channel is not None:
+            msg = await find_latest_verification(channel, member.id)
+    if msg is None:
+        return
+
+    try:
+        fresh = await msg.channel.fetch_message(msg.id)
+        if fresh.embeds and fresh.embeds[0].footer.text == VERIFY_OPEN_FOOTER:
+            embed = fresh.embeds[0].copy()
+            embed.color = PURPLE
+            set_field(embed, "Status", "⚪ `Member left`", inline=True)
+            embed.set_footer(text="Member left ❌")
+            await fresh.edit(embed=embed, view=verify_view(member.id, disabled=True))
+            print(f"🚪 {member} left the server — closed their verification card")
+    except discord.HTTPException as e:
+        print(f"⚠️ Couldn't close the verification card for {member}: {e}")
+
+    member_inviters.pop(member.id, None)
+
+
 async def find_latest_verification(channel: discord.TextChannel, member_id: int) -> discord.Message | None:
     try:
         async for msg in channel.history(limit=100):
@@ -1334,10 +1455,16 @@ async def _send_verification_alert(member: discord.Member, voice_channel: discor
     if existing is None:
         existing = await find_latest_verification(verification_channel, member.id)
         if existing is not None:
-            entry = verify_alerts[member.id] = {"message": existing, "rejoins": 0, "last_edit": 0.0}
+            entry = verify_alerts[member.id] = {
+                "message": existing, "rejoins": 0, "last_edit": 0.0, "last_ping": existing.created_at,
+            }
 
+    previous_reason = None
     if existing is not None and existing.embeds:
-        if existing.embeds[0].footer.text == VERIFY_OPEN_FOOTER:
+        footer_text = existing.embeds[0].footer.text
+
+        # ---- request still open: spam control (counter on the same card + a reminder at most every 5 min) ----
+        if footer_text == VERIFY_OPEN_FOOTER:
             entry["rejoins"] = entry.get("rejoins", 0) + 1
             print(f"⏭️ {member} re-joined, verification request already open (x{entry['rejoins']})")
             if time.monotonic() - entry.get("last_edit", 0.0) >= 5:
@@ -1348,17 +1475,45 @@ async def _send_verification_alert(member: discord.Member, voice_channel: discor
                     entry["last_edit"] = time.monotonic()
                 except discord.HTTPException:
                     pass
+
+            last_ping = entry.get("last_ping") or existing.created_at
+            since_ping = (discord.utils.utcnow() - last_ping).total_seconds()
+            if since_ping >= REJOIN_PING_COOLDOWN:
+                try:
+                    await send_with_retry(
+                        verification_channel,
+                        content=(
+                            f"@everyone {member.mention} is **still waiting** to be verified "
+                            f"(joined the voice channel `{entry['rejoins'] + 1}` times). {existing.jump_url}"
+                        ),
+                        reference=existing.to_reference(fail_if_not_exists=False),
+                        allowed_mentions=discord.AllowedMentions(everyone=True, users=False, replied_user=False),
+                        delete_after=REMINDER_DELETE_AFTER,
+                    )
+                    entry["last_ping"] = discord.utils.utcnow()
+                    print(f"🔔 Reminder ping sent for {member}")
+                except Exception as e:
+                    print(f"⚠️ Couldn't send the reminder ping: {e}")
+            else:
+                print(f"🔕 Reminder for {member} skipped — last ping was {int(since_ping)}s ago")
             return
+
+        # ---- request already handled: wait out the cooldown (unless they left the server and came back) ----
         age = (discord.utils.utcnow() - existing.created_at).total_seconds()
-        if age < VERIFY_REALERT_COOLDOWN:
+        if footer_text != "Member left ❌" and age < VERIFY_REALERT_COOLDOWN:
             print(f"⏭️ {member} re-joined too soon after the last request was handled ({int(age)}s) — skipped")
             return
+
+        if footer_text == "Rejected ❌":
+            previous_reason = get_field(existing.embeds[0], "Reason")
 
     print(f"📤 Sending verification message for {member}")
 
     inviter = member_inviters.get(member.id)
-    invited_by_text = f"Invited by: {inviter.mention}" if inviter else "Invited by: Unknown (vanity URL or unknown invite)"
-    joined_text = discord.utils.format_dt(member.joined_at, "R") if member.joined_at else "Unknown"
+    if inviter:
+        invited_by_text = f"{inviter.mention}\n`{inviter.name}`"
+    else:
+        invited_by_text = "`Unknown`\n*vanity URL or unknown invite*"
 
     warning_text = ""
     if NEW_ACCOUNT_WARNING_DAYS:
@@ -1371,8 +1526,7 @@ async def _send_verification_alert(member: discord.Member, voice_channel: discor
                 age_label = "less than an hour old" if hours < 1 else f"{hours} hour{'s' if hours != 1 else ''} old"
             warning_text = (
                 f"{WARN_EMOJI} **New account warning**\n"
-                f"> This account was created {discord.utils.format_dt(member.created_at, 'R')} "
-                f"(only **{age_label}**, under {NEW_ACCOUNT_WARNING_DAYS} days). "
+                f"> This account is only **{age_label}** (under {NEW_ACCOUNT_WARNING_DAYS} days). "
                 f"Check them carefully before verifying.\n\n"
             )
 
@@ -1380,17 +1534,26 @@ async def _send_verification_alert(member: discord.Member, voice_channel: discor
         title="Member awaiting verification",
         description=(
             f"{warning_text}"
-            f"Member: {member.mention}\n"
-            f"ID: `{member.id}`\n"
-            f"Account created: {discord.utils.format_dt(member.created_at, 'R')}\n"
-            f"Joined server: {joined_text}\n"
-            f"{invited_by_text}\n"
-            f"Joined voice channel: *{voice_channel.name}*"
+            f"## {member.mention} is waiting to be verified\n"
+            f"They joined {voice_channel.mention} — *join them, check, then press a button below.*"
         ),
         color=PURPLE,
     )
     embed.set_thumbnail(url=member.display_avatar.url)
+    embed.add_field(name="Member", value=member.mention, inline=True)
+    embed.add_field(name="ID", value=f"`{member.id}`", inline=True)
+    embed.add_field(name="Status", value="🟡 `Waiting`", inline=True)
+    embed.add_field(name="Account Created", value=discord.utils.format_dt(member.created_at, "R"), inline=True)
+    embed.add_field(
+        name="Joined Server",
+        value=discord.utils.format_dt(member.joined_at, "R") if member.joined_at else "`Unknown`",
+        inline=True,
+    )
+    embed.add_field(name="Invited By", value=invited_by_text, inline=True)
+    if previous_reason:
+        embed.add_field(name="Previous Rejection", value=previous_reason[:1024], inline=False)
     embed.set_footer(text=VERIFY_OPEN_FOOTER)
+    embed.timestamp = discord.utils.utcnow()
 
     try:
         sent = await send_with_retry(
@@ -1400,7 +1563,9 @@ async def _send_verification_alert(member: discord.Member, voice_channel: discor
             view=verify_view(member.id),
             allowed_mentions=discord.AllowedMentions(everyone=True),
         )
-        verify_alerts[member.id] = {"message": sent, "rejoins": 0, "last_edit": 0.0}
+        verify_alerts[member.id] = {
+            "message": sent, "rejoins": 0, "last_edit": 0.0, "last_ping": discord.utils.utcnow(),
+        }
         print(f"✅ Verification message sent for {member}")
     except Exception as e:
         print(f"❌ Failed to send verification message: {e}")
