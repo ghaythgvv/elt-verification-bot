@@ -1,1395 +1,1599 @@
 """
-ELT Punishment Bot  (v3)
+Discord Verification Bot  (v2)
 =======================================
-Slash commands: /warn /unwarn /mute /timeout /kick /ban /blacklist /unblacklist
-                +  /warnings /history /blacklisted
-Posts an ANIMATED punishment card (punishment_gif.render_card_gif) with the target's avatar and
-name plus a "View Punishment Details" button. Falls back to the still PNG card if needed.
-/blacklist cards use the skull banner (blacklist_banner.jpg) as their background.
+What's new in v2 (support panel in #describe-issue):
+    - ANYONE can press "Describe Issue" in #describe-issue - no voice channel needed.
+    - A member is added to "Current queue" when they SEND their issue (not when they join a voice channel).
+    - Sending an issue from the panel opens the mod alert (@everyone, Claim / Resolve buttons) by itself.
+    - Members who are not in a voice channel get a short self-deleting ping in #describe-issue when a
+      moderator claims or resolves their request.
+    - Joining the "Waiting for Help" voice channel still works as before (mod alert + the short ping in
+      #describe-issue), but the member only appears in the queue after they press Describe Issue.
 
-Who can use what:
-    Staff (lowest role in STAFF_ROLE_IDS, or above) -> /warn  /unwarn
-    Moderators (MOD_ROLE_ID, or above)              -> + /warnings /history /blacklisted /mute /timeout
-    HIGH RANK (ADMIN_ROLE_ID or above, Administrators, server owner)
-                                                    -> everything: + /kick /ban /blacklist /unblacklist
-
-Moderators can NOT kick or ban (MODS_CAN_KICK / MODS_CAN_BAN = False). Only the high rank can.
-When a Moderator or Staff gives a 3rd warning, no ban happens: the high rank is pinged instead.
-
-Nobody can punish: the server owner, an Administrator, or anyone whose top role is ABOVE the
-Moderator role. And nobody can punish someone whose top role is equal to or above their own.
-
-/blacklist
-    - Removes ALL roles from the member (except the Super Member role and Discord-managed ones like
-      Server Booster) and gives BLACKLIST_ROLE_ID. The removed roles are saved, so /unblacklist can give them back.
-    - Posts a BLACKLIST card with the skull banner (every other card uses the same banner now too).
-    - The blacklist is locked: if anyone (or another bot, e.g. verification) gives a blacklisted member
-      a role, it is removed again; if they remove the blacklist role, it is put back; if the member
-      leaves and rejoins, they get the blacklist role again.
-    - Only /unblacklist lifts it.
-
-What's new in v3
-    - /blacklist, /unblacklist, /blacklisted. The Super Member role is never removed by /blacklist.
-    - Every card (warn, unwarn, mute, timeout, kick, ban, blacklist) now uses the skull banner.
-    - /kick and /ban are for the high rank only (the "high rank" now also counts the ADMIN_ROLE_ID role,
-      not only members with the Administrator permission).
-    - Warning severity is passed to the card directly (no more temporary change of the shared style table).
-    - Longer stamps (BLACKLIST, WARNING CLEARED) are drawn smaller so they don't run into the title.
-    - Fixed: a very dark card background could turn black pixels see-through in the GIF.
-    - Fixed: the animated background was decoded again on every card (cache is bigger now).
+Everything else works exactly as before:
+1) "Waiting for Move" voice channel -> nickname gets ⏳, verification embed with Verify / Reject.
+2) "Waiting for Help" voice channel -> nickname gets ⏳, mod alert with Claim / Resolve.
+3) "REPORT" voice channels -> nickname gets 📛, a private report room is created.
+4) Verify gives the Verified + Member roles and removes Unverified.
+All buttons are PERSISTENT (they keep working after restarts / redeploys).
 
 Requirements:
-    pip install discord.py Pillow     (discord.py 2.4 or newer)
+    pip install "discord.py>=2.4"
 
 Before running:
-    - punishment_card.py, punishment_gif.py, blacklist_banner.jpg and the fonts/ folder next to this file.
-      (card_bg.gif is only used as a backup if the banner picture is missing.)
-    - SERVER MEMBERS INTENT enabled in the Developer Portal.
-    - Invite with the "bot" and "applications.commands" scopes.
-    - DISCORD_TOKEN env variable (Railway Variables). Optional STAFF_ROLE_IDS (comma separated).
-    - The bot's role must sit ABOVE anyone you want to punish, above the Warn roles and above the Blacklist role.
-    - The bot needs Manage Roles, Moderate Members, Kick Members and Ban Members.
-    - Railway: add a Volume mounted at /data so cases and the blacklist survive redeploys.
-    - This bot needs its OWN Discord application + token (shared tokens overwrite each other's commands).
-
-If the slash commands ever disappear: an admin mentions the bot and types "sync".
+    - Enable SERVER MEMBERS INTENT for your bot in the Discord Developer Portal.
+    - Give the bot "Manage Nicknames" and put the bot's role ABOVE the roles it must rename.
+    - In #describe-issue the bot needs View Channel, Send Messages, Embed Links, Mention Everyone,
+      Read Message History and Manage Messages, and members must be able to see the channel.
+    - Set DISCORD_TOKEN as an environment variable (Railway > Variables).
 """
 
-import io
+from __future__ import annotations
+
 import os
 import re
-import json
-import time
-import shutil
 import asyncio
-import traceback
-from datetime import datetime, timedelta, timezone
+import time
+from datetime import timedelta
 
 import discord
-from discord import app_commands
-from discord.ext import commands, tasks
-
-from punishment_card import render_card, TYPE_STYLE
-from punishment_gif import render_card_gif, clean_for_card, MAX_BYTES, BANNER_PATH
-
-# Own style for the green "warning cleared" card.
-TYPE_STYLE.setdefault("WARNING CLEARED", ((70, 220, 120), 100))
-
-# Serialises every /warn: counting, card style, saving and roles happen one warn at a time.
-warning_lock = asyncio.Lock()
-# Serialises /blacklist and /unblacklist.
-blacklist_lock = asyncio.Lock()
+from discord.ext import commands
 
 # =========================== CONFIG ===========================
 TOKEN = os.environ.get("DISCORD_TOKEN")
 
-GUILD_ID = 1410440666747633707
-GUILD = discord.Object(id=GUILD_ID)
+GUILD_ID = 1410440666747633707  # ELT server ID
 
-PUNISHMENT_LOG_CHANNEL_ID = None   # None = post in the channel where the command was used
+# Channels
+VERIFICATION_CHANNEL_ID = 1542531178526146670  # channel where verify requests get posted
+WELCOME_CHANNEL_ID = None                        # welcome channel (optional)
+WAITING_VC_ID = 1513904254535073883              # the "Waiting for Move" voice channel
 
-MOD_ROLE_ID = 1513904125086011402
-ADMIN_ROLE_ID = 1513904120803889243   # the HIGH RANK role: can kick / ban / blacklist, pinged on a 3rd warning
+HELP_ALERT_CHANNEL_ID = 1551163762084683866  # channel where the mod alert gets posted
+MEMBER_HELP_PANEL_CHANNEL_ID = 1553786062579699722  # #describe-issue (the shared panel lives here)
+ISSUE_REPORTS_CHANNEL_ID = 1553196616146493460  # channel where "Describe Issue" submissions get posted
 
-# Who may use the heavy commands. False = high rank only.
-MODS_CAN_BAN = False
-MODS_CAN_KICK = False
-BLACKLIST_MIN_TIER = "admin"       # "admin" = high rank only, "mod" = moderators too
-
-WARN_1_ROLE_ID = 1513904153900875897
-WARN_2_ROLE_ID = 1513904154719027291
-
-BLACKLIST_ROLE_ID = 1554563076681109524   # the role a blacklisted member gets
-SUPER_MEMBER_ROLE_ID = 1513904142551220366   # NEVER taken away by /blacklist
-KEEP_ROLE_IDS = {SUPER_MEMBER_ROLE_ID}       # add more role IDs here if /blacklist should leave them alone
-
-WARNING_EXPIRE_DAYS = 30
-MAX_WARNINGS = 3
-
-WARNING_CLEAR_CHANNEL_ID = 1540154905644367893
-
-DM_PUNISHED_MEMBERS = True   # send the punished member a DM with the reason
-
-STAFF_ROLE_IDS = {
-    int(x)
-    for x in os.environ.get("STAFF_ROLE_IDS", "1513904136783925380").replace(" ", "").split(",")
-    if x.isdigit()
+# Per-VC settings for the "waiting for help" flow:
+#   emoji: shown in the mod alert title | send_member_panel: list members on the shared panel queue
+HELP_VC_CONFIG = {
+    1517941411151085691: {"emoji": "", "send_member_panel": True},
 }
+# Used for requests sent from the panel by members who are NOT in a help voice channel.
+DEFAULT_HELP_CONFIG = next(iter(HELP_VC_CONFIG.values()), {"emoji": "", "send_member_panel": True})
 
-DATA_DIR = (
-    os.environ.get("DATA_DIR")
-    or os.environ.get("RAILWAY_VOLUME_MOUNT_PATH")
-    or os.path.dirname(os.path.abspath(__file__))
-)
-DB_PATH = os.path.join(DATA_DIR, "punishments.json")
+# Nickname emojis
+WAITING_VC_EMOJI = "⏳"
+REPORT_VC_EMOJI = "📛"
+LEGACY_ALERT_EMOJIS = {"⛔"}
+REPORT_VC_IDS = {
+    1517940974125318166,
+    1554981588880850964,
+}
+REPORT_CATEGORY_ID = 1517941029221695760
+REPORT_CHANNEL_NAME = "📛┃𝗥𝗘𝗣𝗢𝗥𝗧"
+LEGACY_REPORT_CHANNEL_NAMES = {"⛔┃𝗥𝗘𝗣𝗢𝗥𝗧"}
+
+ALERT_VC_EMOJIS = {
+    WAITING_VC_ID: WAITING_VC_EMOJI,
+    **{vc_id: WAITING_VC_EMOJI for vc_id in HELP_VC_CONFIG},
+    **{vc_id: REPORT_VC_EMOJI for vc_id in REPORT_VC_IDS},
+}
+ALERT_VC_IDS = set(ALERT_VC_EMOJIS)
+ALERT_EMOJIS = set(ALERT_VC_EMOJIS.values())
+_STRIPPABLE_EMOJIS = sorted(ALERT_EMOJIS | LEGACY_ALERT_EMOJIS, key=len, reverse=True)
+
+# Roles
+UNVERIFIED_ROLE_ID = 1513904174079934657
+VERIFIED_ROLE_ID = 1513904156350353511
+EXTRA_ROLES_ON_VERIFY = [1513904151309058159]  # MEMBER role
+
+# New-account warning (0 = off)
+NEW_ACCOUNT_WARNING_DAYS = 7
+WARN_EMOJI = "<:warn_purple:1554671365490212945>"
+
+# Anti-spam
+VERIFY_REALERT_COOLDOWN = 5 * 60
+HELP_LEAVE_GRACE = 20
+REPORT_ROOM_COOLDOWN = 10
 # ================================================================
 
 intents = discord.Intents.default()
 intents.members = True
+intents.voice_states = True
+intents.invites = True
 
-bot = commands.Bot(command_prefix=commands.when_mentioned, intents=intents)
+bot = commands.Bot(command_prefix="!", intents=intents)
 
-_BOLD_UPPER_START = 0x1D5D4
-_BOLD_LOWER_START = 0x1D5EE
-_BOLD_DIGIT_START = 0x1D7EC
+invite_cache = {}
+member_inviters = {}
+report_vc_base_nicknames = {}
+_nick_locks: dict[int, asyncio.Lock] = {}
+_nick_failed: set[int] = set()
 
+# help_panels[member_id] = {
+#     "alert": the mod alert message (or None while it is being posted),
+#     "origin": "vc" (joined the help VC) or "panel" (sent from #describe-issue),
+#     "queued": True once the member SENT their issue -> only queued members are listed on the panel,
+#     "show": the VC config allows listing on the panel,
+#     "described", "claimed", "status", "joined_at", "queued_at"
+# }
+help_panels = {}
 
-def bold(text: str) -> str:
-    """A-Z, a-z, 0-9 -> Mathematical Sans-Serif Bold."""
-    if not text:
-        return text
-    out = []
-    for ch in text:
-        code = ord(ch)
-        if 65 <= code <= 90:
-            out.append(chr(_BOLD_UPPER_START + (code - 65)))
-        elif 97 <= code <= 122:
-            out.append(chr(_BOLD_LOWER_START + (code - 97)))
-        elif 48 <= code <= 57:
-            out.append(chr(_BOLD_DIGIT_START + (code - 48)))
-        else:
-            out.append(ch)
-    return "".join(out)
+verify_alerts: dict[int, dict] = {}
+_verify_locks: dict[int, asyncio.Lock] = {}
+member_report_rooms: dict[int, int] = {}
+_report_locks: dict[int, asyncio.Lock] = {}
+_report_last_created: dict[int, float] = {}
+_leave_tasks: dict[int, asyncio.Task] = {}
+VERIFY_OPEN_FOOTER = "Click Verify to let this member in"
 
+shared_panel: discord.Message | None = None
+_panel_lock = asyncio.Lock()
 
-def short(text: str, n: int) -> str:
-    text = (text or "").replace("\n", " ")
-    return text if len(text) <= n else text[: n - 1] + "…"
+_startup_sync_done = False
 
+ALERT_DONE_FOOTERS = ("Resolved", "Member left", "Cancelled", "Resolved ✅", "Resolved ☑️", "Member left ❌", "Cancelled ⚪")
+ALERT_STATUS = {
+    "Resolved": "🟢 `Resolved`",
+    "Member left": "🔴 `Member left`",
+    "Cancelled": "⚪ `Cancelled`",
+    "Member moved": "🔵 `Member moved`",
+}
 
-# ================================================================
-# CASE NUMBERS + DATABASE (crash-safe)
-# ================================================================
-
-def _read_db_file(path: str):
-    with open(path, encoding="utf-8") as f:
-        data = json.load(f)
-    records = {int(k): v for k, v in data.get("records", {}).items()}
-    blacklist = {int(k): v for k, v in data.get("blacklist", {}).items()}
-    return int(data.get("counter", 0)), records, blacklist
-
-
-def load_db():
-    """Reads the database. A corrupt file is copied aside (never overwritten) and the backup is tried."""
-    for path in (DB_PATH, DB_PATH + ".bak"):
-        try:
-            counter, records, blacklist = _read_db_file(path)
-            if path != DB_PATH:
-                print(f"♻️ Restored the case database from {path}")
-            return max(counter, max(records) if records else 0), records, blacklist
-        except FileNotFoundError:
-            continue
-        except Exception as e:
-            print(f"⚠️ Couldn't read {path}: {e}")
-            try:
-                shutil.copyfile(path, f"{path}.corrupt-{int(time.time())}")
-                print(f"📦 Kept a copy of the unreadable file as {path}.corrupt-*")
-            except Exception:
-                pass
-    return 0, {}, {}
+# Short self-deleting @mention in #describe-issue (edits to the panel never notify anyone).
+PING_ON_JOIN = True           # short ping when a member joins Waiting for Help (deletes itself)
+PING_DELETE_AFTER = 8
+JOIN_PING_TEXT = "your request is in — check the panel and press **Describe Issue** to tell us what is wrong."
+NOTIFY_DELETE_AFTER = 12      # "a moderator picked up your request" pings stay a bit longer
+SUPPORT_TITLE_EMOJI = "<:support:1555003977173573684>"
+CANCEL_EMOJI = discord.PartialEmoji(name="cancel", id=1554671367142645770, animated=False)
+PANEL_TITLE = f"{SUPPORT_TITLE_EMOJI} Support Request Received"
+PURPLE = discord.Color.purple()
+_bg_tasks: set = set()
 
 
-def save_db():
+async def cache_invites(guild: discord.Guild):
     try:
-        os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-        tmp = DB_PATH + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(
-                {"counter": case_counter, "records": punishment_records, "blacklist": blacklist_records},
-                f, ensure_ascii=False,
-            )
-        if os.path.exists(DB_PATH):
-            try:
-                shutil.copyfile(DB_PATH, DB_PATH + ".bak")
-            except Exception as e:
-                print(f"⚠️ Couldn't refresh the backup: {e}")
-        os.replace(tmp, DB_PATH)
-    except Exception as e:
-        print(f"❌ Couldn't save {DB_PATH}: {e}")
+        invites = await guild.invites()
+        invite_cache[guild.id] = {
+            invite.code: {"uses": invite.uses or 0, "max_uses": invite.max_uses, "inviter": invite.inviter}
+            for invite in invites
+        }
+        print(f"✅ Cached {len(invites)} invites for guild {guild.id}")
+    except discord.Forbidden:
+        print(f"⚠️ Bot doesn't have permission to view invites in guild {guild.id}")
+    except discord.HTTPException as e:
+        print(f"⚠️ Failed to cache invites: {e}")
 
 
-case_counter, punishment_records, blacklist_records = load_db()
-print(f"📁 Case data: {DB_PATH} (last case #{case_counter:04d}, {len(punishment_records)} saved, "
-      f"{len(blacklist_records)} blacklisted)")
-
-
-def next_case() -> int:
-    global case_counter
-    case_counter += 1
-    save_db()
-    return case_counter
-
-
-def card_name(member: discord.abc.User) -> str:
-    return clean_for_card(member.display_name) or member.name
-
-
-def audit_reason(reason: str, action: str, by: discord.abc.User) -> str:
-    return f"{reason} — {action} by {by}"[:512]
-
-
-# ================================================================
-# PERMISSIONS
-# ================================================================
-TIER_RANK = {"none": 0, "staff": 1, "mod": 2, "admin": 3}
-TIER_LABEL = {"staff": "Staff", "mod": "Moderators", "admin": "the high rank"}
-BAN_MIN_TIER = "mod" if MODS_CAN_BAN else "admin"
-KICK_MIN_TIER = "mod" if MODS_CAN_KICK else "admin"
-
-
-class NotAllowed(app_commands.CheckFailure):
-    """The text is shown to the user."""
-
-
-def actor_tier(member: discord.Member) -> str:
-    guild = member.guild
-    if member.id == guild.owner_id or member.guild_permissions.administrator:
-        return "admin"
-    # the high-rank ROLE counts too (it may not have the Administrator permission)
-    admin_role = guild.get_role(ADMIN_ROLE_ID)
-    if admin_role and member.top_role >= admin_role:
-        return "admin"
-    mod_role = guild.get_role(MOD_ROLE_ID)
-    if mod_role and member.top_role >= mod_role:
-        return "mod"
-    staff_roles = [r for r in (guild.get_role(i) for i in STAFF_ROLE_IDS) if r]
-    if staff_roles and member.top_role >= min(staff_roles):
-        return "staff"
-    return "none"
-
-
-def can_ban(member: discord.Member) -> bool:
-    return TIER_RANK[actor_tier(member)] >= TIER_RANK[BAN_MIN_TIER]
-
-
-def require_tier(min_tier: str):
-    async def predicate(interaction: discord.Interaction) -> bool:
-        if isinstance(interaction.user, discord.Member) and TIER_RANK[actor_tier(interaction.user)] >= TIER_RANK[min_tier]:
-            return True
-        raise NotAllowed(f"This command is for {TIER_LABEL[min_tier]} or higher.")
-    return app_commands.check(predicate)
-
-
-def target_problem(interaction: discord.Interaction, member: discord.Member, needs_bot_rank: bool = True):
-    """Returns a message if the punishment shouldn't go ahead."""
-    guild = interaction.guild
-
-    if member.id == interaction.user.id:
-        return "You can't punish yourself."
-    if bot.user and member.id == bot.user.id:
-        return "I can't punish myself."
-    if member.id == guild.owner_id:
-        return "You can't punish the server owner."
-    if member.guild_permissions.administrator:
-        return "You can't punish an administrator."
-
-    mod_role = guild.get_role(MOD_ROLE_ID)
-    if mod_role and member.top_role > mod_role:
-        return "That member is protected (their role is above Moderator)."
-
-    if interaction.user.id != guild.owner_id and member.top_role >= interaction.user.top_role:
-        return "That member's highest role is equal to or above yours."
-
-    if needs_bot_rank and guild.me and member.top_role >= guild.me.top_role:
-        return "That member's highest role is equal to or above mine — move my role higher."
-
-    return None
-
-
-def get_log_channel(interaction: discord.Interaction):
-    channel = (
-        interaction.guild.get_channel(PUNISHMENT_LOG_CHANNEL_ID)
-        if PUNISHMENT_LOG_CHANNEL_ID else interaction.channel
-    )
-    return channel or interaction.channel
-
-
-# ================================================================
-# SENDING HELPERS
-# ================================================================
 async def send_with_retry(channel, **kwargs):
-    """discord.py already waits out normal rate limits; this adds a few retries for hiccups."""
-    delays = [1, 2, 4, 8]
-    for attempt in range(len(delays) + 1):
+    max_attempts = 5
+    backoff_delays = [1, 2, 4, 8, 16]
+    for attempt in range(max_attempts):
         try:
             return await channel.send(**kwargs)
         except discord.HTTPException as e:
-            retryable = e.status == 429 or e.status >= 500
-            if not retryable or attempt == len(delays):
+            if e.status == 429 and attempt < max_attempts - 1:
+                delay = backoff_delays[attempt]
+                print(f"⏳ Rate limited, retrying in {delay}s (attempt {attempt + 1}/{max_attempts})")
+                await asyncio.sleep(delay)
+            else:
                 raise
-            print(f"⏳ Send failed ({e.status}), retrying in {delays[attempt]}s")
-            await asyncio.sleep(delays[attempt])
 
 
-async def dm_member(user: discord.abc.User, guild: discord.Guild, title: str, reason: str, color: int, note: str = ""):
-    """DMs the punished member. Returns the message (so it can be deleted again) or None."""
-    if not DM_PUNISHED_MEMBERS or getattr(user, "bot", False):
+def set_field(embed: discord.Embed, name: str, value: str, inline: bool = False):
+    for i, f in enumerate(embed.fields):
+        if f.name == name:
+            embed.set_field_at(i, name=name, value=value, inline=inline)
+            return
+    embed.add_field(name=name, value=value, inline=inline)
+
+
+def get_field(embed: discord.Embed, name: str) -> str | None:
+    for f in embed.fields:
+        if f.name == name:
+            return f.value
+    return None
+
+
+# ====================== Nickname emoji (⏳ waiting / 📛 report) ======================
+report_room_ids: set[int] = set()
+
+
+def _is_report_room(channel) -> bool:
+    if channel is None or channel.id in REPORT_VC_IDS:
+        return False
+    if channel.id in report_room_ids:
+        return True
+    return (
+        getattr(channel, "category_id", None) == REPORT_CATEGORY_ID
+        and (channel.name == REPORT_CHANNEL_NAME or channel.name in LEGACY_REPORT_CHANNEL_NAMES)
+    )
+
+
+def _alert_emoji_for(member: discord.Member) -> str | None:
+    channel = member.voice.channel if member.voice else None
+    if channel is None:
         return None
-    embed = discord.Embed(title=bold(title), color=color, timestamp=discord.utils.utcnow())
-    embed.add_field(name=bold("Reason"), value=short(reason, 1000), inline=False)
-    if note:
-        embed.add_field(name=bold("Info"), value=short(note, 1000), inline=False)
-    embed.set_footer(text=guild.name)
-    try:
-        return await user.send(embed=embed)
-    except (discord.Forbidden, discord.HTTPException):
-        return None
+    if _is_report_room(channel):
+        return REPORT_VC_EMOJI
+    return ALERT_VC_EMOJIS.get(channel.id)
 
 
-async def undo_dm(message):
-    """Removes a DM again when the action it announced failed."""
-    if message is None:
+async def create_report_room(member: discord.Member):
+    guild = member.guild
+    lock = _report_locks.setdefault(member.id, asyncio.Lock())
+    async with lock:
+        def _in_trigger() -> bool:
+            m = guild.get_member(member.id)
+            return bool(m and m.voice and m.voice.channel and m.voice.channel.id in REPORT_VC_IDS)
+
+        if not _in_trigger():
+            return
+
+        room = None
+        created_new = False
+        existing_id = member_report_rooms.get(member.id)
+        existing = guild.get_channel(existing_id) if existing_id else None
+        if isinstance(existing, discord.VoiceChannel) and _is_report_room(existing):
+            room = existing
+        else:
+            wait = REPORT_ROOM_COOLDOWN - (time.monotonic() - _report_last_created.get(member.id, 0.0))
+            if wait > 0:
+                await asyncio.sleep(wait)
+                if not _in_trigger():
+                    return
+
+            category = guild.get_channel(REPORT_CATEGORY_ID)
+            if not isinstance(category, discord.CategoryChannel):
+                print("⚠️ Couldn't find the REPORT category — check REPORT_CATEGORY_ID")
+                return
+            try:
+                room = await guild.create_voice_channel(
+                    REPORT_CHANNEL_NAME,
+                    category=category,
+                    overwrites=category.overwrites,
+                    reason=f"Report room for {member}",
+                )
+            except discord.Forbidden:
+                print("⚠️ Can't create the report room — give the bot 'Manage Channels'")
+                return
+            except discord.HTTPException as e:
+                print(f"❌ Failed to create report room: {e}")
+                return
+            created_new = True
+            report_room_ids.add(room.id)
+            member_report_rooms[member.id] = room.id
+            _report_last_created[member.id] = time.monotonic()
+
+        try:
+            await member.move_to(room, reason="Moved into their report room")
+            print(f"✅ Report room {'created' if created_new else 'reused'} for {member}")
+            await asyncio.sleep(0.5)
+            await set_report_vc_alert(member)
+        except discord.Forbidden:
+            print("⚠️ Can't move the member — give the bot 'Move Members'")
+            if created_new:
+                await room.delete(reason="Couldn't move the member in")
+        except discord.HTTPException as e:
+            print(f"⚠️ Couldn't move {member} into the report room: {e}")
+            if created_new:
+                try:
+                    await room.delete(reason="Member was no longer in voice")
+                except discord.HTTPException:
+                    pass
+
+
+async def delete_if_empty_report_room(channel):
+    if not _is_report_room(channel):
+        return
+    if any(not m.bot for m in channel.members):
         return
     try:
-        await message.delete()
+        await channel.delete(reason="Report room is empty")
+        report_room_ids.discard(channel.id)
+        for mid, rid in list(member_report_rooms.items()):
+            if rid == channel.id:
+                del member_report_rooms[mid]
+        print(f"🗑️ Deleted empty report room {channel.id}")
     except discord.HTTPException:
         pass
 
 
-# ================================================================
-# PUNISHMENT DETAILS BUTTON
-# ================================================================
-class PunishmentDetailsButton(discord.ui.DynamicItem[discord.ui.Button], template=r"punishment_details_(?P<case>[0-9]+)"):
-    def __init__(self, case_no: int):
+def _in_alert_vc(member: discord.Member) -> bool:
+    return _alert_emoji_for(member) is not None
+
+
+def _strip_alert_prefix(nick: str | None) -> tuple[str | None, bool]:
+    had_prefix = False
+    while nick:
+        for emoji in _STRIPPABLE_EMOJIS:
+            if nick.startswith(emoji):
+                nick = nick[len(emoji):].lstrip()
+                had_prefix = True
+                break
+        else:
+            break
+    if had_prefix and not nick:
+        nick = None
+    return nick, had_prefix
+
+
+_EMOJI_CHARS = (
+    "\U0001F000-\U0001FAFF"
+    "\U000E0020-\U000E007F"
+    "\u00A9\u00AE\u203C\u2049\u2122\u2139"
+    "\u2194-\u21AA\u221E"
+    "\u231A-\u23FF"
+    "\u24C2\u25AA-\u25FE"
+    "\u2600-\u27BF"
+    "\u2934\u2935\u2B00-\u2BFF\u3030\u303D\u3297\u3299"
+    "\u200D\uFE0F\u20E3"
+)
+_LEADING_EMOJI_RE = re.compile(f"^[{_EMOJI_CHARS}\\s]+")
+
+
+def _strip_leading_emoji(text: str | None) -> str:
+    if not text:
+        return ""
+    return _LEADING_EMOJI_RE.sub("", text).strip()
+
+
+def _has_exact_prefix(nick: str | None, emoji: str) -> bool:
+    if not nick or not nick.startswith(f"{emoji} "):
+        return False
+    rest = nick[len(emoji) + 1:]
+    return bool(rest) and not _LEADING_EMOJI_RE.match(rest)
+
+
+def get_report_vc_base_nickname(member: discord.Member) -> str | None:
+    if member.id not in report_vc_base_nicknames:
+        nick, had_prefix = _strip_alert_prefix(member.nick)
+        if had_prefix and (not nick or nick in (member.name, member.global_name)):
+            nick = None
+        report_vc_base_nicknames[member.id] = nick
+    return report_vc_base_nicknames[member.id]
+
+
+async def set_report_vc_alert(member: discord.Member):
+    """Make the member's nickname match where they are RIGHT NOW (⏳ waiting / 📛 report / original)."""
+    lock = _nick_locks.setdefault(member.id, asyncio.Lock())
+    async with lock:
+        fresh = member.guild.get_member(member.id) or member
+        emoji = _alert_emoji_for(fresh)
+        active = emoji is not None
+
+        if active:
+            base_nick = get_report_vc_base_nickname(fresh)
+            visible_name = ""
+            for candidate in (base_nick, fresh.global_name, fresh.name):
+                visible_name = _strip_leading_emoji(candidate)
+                if visible_name:
+                    break
+            visible_name = visible_name or fresh.name
+            target_nick = f"{emoji} {visible_name}"[:32]
+        else:
+            _, had_prefix = _strip_alert_prefix(fresh.nick)
+            if had_prefix:
+                target_nick = get_report_vc_base_nickname(fresh)
+            else:
+                report_vc_base_nicknames.pop(fresh.id, None)
+                return
+
+        if fresh.nick == target_nick:
+            if not active:
+                report_vc_base_nicknames.pop(fresh.id, None)
+            return
+
+        try:
+            await fresh.edit(nick=target_nick, reason="Waiting/help/report VC occupancy changed")
+            print(f"✏️ {fresh} nickname -> {target_nick!r}")
+            if not active:
+                report_vc_base_nicknames.pop(fresh.id, None)
+        except discord.Forbidden:
+            if fresh.id == fresh.guild.owner_id:
+                reason = "Discord never lets a bot change the server owner's nickname"
+            else:
+                reason = "give the bot 'Manage Nicknames' and move the bot's role ABOVE this member's top role"
+            print(f"⚠️ Can't change {fresh}'s nickname — {reason}")
+            _nick_failed.add(fresh.id)
+            if not active:
+                report_vc_base_nicknames.pop(fresh.id, None)
+        except discord.HTTPException as e:
+            print(f"⚠️ Failed to update {fresh}'s nickname: {e}")
+
+
+# ====================== Persistent buttons ======================
+def _already_done(message: discord.Message, done_footers: tuple[str, ...]) -> bool:
+    return bool(message.embeds and message.embeds[0].footer.text in done_footers)
+
+
+class VerifyButton(
+    discord.ui.DynamicItem[discord.ui.Button],
+    template=r"verify_(?P<action>accept|reject)_(?P<uid>[0-9]+)",
+):
+    def __init__(self, action: str, member_id: int, disabled: bool = False):
+        if action == "accept":
+            label, style = "☑️ Verify", discord.ButtonStyle.secondary
+        else:
+            label, style = "❌ Reject", discord.ButtonStyle.secondary
         super().__init__(
             discord.ui.Button(
-                label=f"🔍 {bold('View Punishment Details')}",
-                style=discord.ButtonStyle.secondary,
-                custom_id=f"punishment_details_{case_no}",
+                label=label,
+                style=style,
+                custom_id=f"verify_{action}_{member_id}",
+                disabled=disabled,
             )
         )
-        self.case_no = case_no
+        self.action = action
+        self.member_id = member_id
 
     @classmethod
-    async def from_custom_id(cls, interaction: discord.Interaction, item: discord.ui.Button, match: re.Match):
-        return cls(int(match["case"]))
+    async def from_custom_id(cls, interaction: discord.Interaction, item: discord.ui.Button, match, /):
+        return cls(match["action"], int(match["uid"]))
 
     async def callback(self, interaction: discord.Interaction):
-        record = punishment_records.get(self.case_no)
-        if record is None:
-            return await interaction.response.send_message(
-                bold("Details for this case aren't available anymore."), ephemeral=True
-            )
+        await interaction.response.defer()
 
-        display_type = record.get("display_type", record["type"])
-        style = TYPE_STYLE.get(display_type) or TYPE_STYLE.get(record["type"]) or ((150, 150, 150), 0)
+        if _already_done(interaction.message, ("Verified ☑️", "Verified ✅", "Rejected ❌")):
+            return await interaction.followup.send("This request was already handled.", ephemeral=True)
 
-        embed = discord.Embed(
-            title=bold(f"Case ELT-{self.case_no:04d} — {display_type.title()}"),
-            color=discord.Color.from_rgb(*style[0]),
-        )
-        embed.add_field(name=bold("User"), value=f"<@{record['user_id']}> ({bold(record['user_tag'])})", inline=False)
-        embed.add_field(name=bold("Punisher"), value=f"<@{record['punisher_id']}> ({bold(record['punisher_tag'])})", inline=False)
-        embed.add_field(name=bold("Reason"), value=bold(short(record["reason"], 300)), inline=False)
-        embed.add_field(name=bold("Date"), value=bold(record["date_text"]), inline=True)
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        embed = interaction.message.embeds[0].copy()
 
+        if self.action == "accept":
+            guild = interaction.guild
+            member = guild.get_member(self.member_id)
+            if member is None:
+                try:
+                    member = await guild.fetch_member(self.member_id)
+                except discord.HTTPException:
+                    member = None
+            if member is None:
+                return await interaction.followup.send(
+                    "That member isn't in the server anymore (they may have left).", ephemeral=True
+                )
 
-# ================================================================
-# WARNING SYSTEM
-# ================================================================
-def _warning_is_active(record: dict) -> bool:
-    return record.get("type") == "WARNING" and record.get("warning_active", True) is not False
+            unverified_role = guild.get_role(UNVERIFIED_ROLE_ID)
+            verified_role = guild.get_role(VERIFIED_ROLE_ID)
 
+            try:
+                if unverified_role and unverified_role in member.roles:
+                    await member.remove_roles(unverified_role, reason=f"Verified by {interaction.user}")
+                if verified_role:
+                    await member.add_roles(verified_role, reason=f"Verified by {interaction.user}")
+                for rid in EXTRA_ROLES_ON_VERIFY:
+                    r = guild.get_role(rid)
+                    if r:
+                        await member.add_roles(r, reason="Extra role after verification")
+            except discord.Forbidden:
+                return await interaction.followup.send(
+                    "The bot doesn't have enough permission to change roles (make sure the bot's role is above the roles it manages).",
+                    ephemeral=True,
+                )
+            except discord.HTTPException as e:
+                print(f"❌ Failed to change roles for {member}: {e}")
+                return await interaction.followup.send("Something went wrong while changing roles. Try again.", ephemeral=True)
 
-def _parse_warning_time(record: dict):
-    value = record.get("warning_issued_at")
-    if not value:
-        return None
-    try:
-        dt = datetime.fromisoformat(value)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
-    except (TypeError, ValueError):
-        return None
+            embed.color = PURPLE
+            embed.add_field(name="Verified", value=f"☑️ {interaction.user.mention}", inline=False)
+            embed.set_footer(text="Verified ☑️")
+            member_inviters.pop(self.member_id, None)
+            await interaction.edit_original_response(embed=embed, view=verify_view(self.member_id, disabled=True))
 
-
-def active_warning_records(member_id: int):
-    records = [
-        (case_no, record)
-        for case_no, record in punishment_records.items()
-        if record.get("user_id") == member_id and _warning_is_active(record)
-    ]
-    records.sort(key=lambda item: (item[1].get("warning_issued_at", ""), item[0]))
-    return records
-
-
-def active_warning_count(member_id: int) -> int:
-    return len(active_warning_records(member_id))
-
-
-def warning_percent(count: int) -> int:
-    return 0 if count <= 0 else 33 if count == 1 else 66 if count == 2 else 100
-
-
-async def update_warning_roles(guild: discord.Guild, member: discord.Member, count: int):
-    """1 warning: Warn 1 | 2 warnings: Warn 2 | 0 or 3+: none."""
-    # A blacklisted member keeps only the blacklist role.
-    if member.id in blacklist_records:
-        return
-
-    warn1 = guild.get_role(WARN_1_ROLE_ID)
-    warn2 = guild.get_role(WARN_2_ROLE_ID)
-    if warn1 is None or warn2 is None:
-        print("⚠️ Warning role not found — check WARN_1_ROLE_ID / WARN_2_ROLE_ID")
-        return
-
-    wanted = {warn1} if count == 1 else {warn2} if count == 2 else set()
-    current = {r for r in (warn1, warn2) if r in member.roles}
-    add_roles, remove_roles = wanted - current, current - wanted
-
-    try:
-        if add_roles:
-            await member.add_roles(*add_roles, reason="Warning level updated")
-        if remove_roles:
-            await member.remove_roles(*remove_roles, reason="Warning level updated")
-    except discord.Forbidden:
-        print(f"❌ Bot cannot manage warning roles for {member} — move the bot role above them.")
-    except discord.HTTPException as e:
-        print(f"❌ Failed to update warning roles for {member}: {e}")
+            if WELCOME_CHANNEL_ID:
+                welcome_channel = guild.get_channel(WELCOME_CHANNEL_ID)
+                if welcome_channel:
+                    try:
+                        await welcome_channel.send(
+                            f"🎉 Welcome {member.mention}, you're verified — glad to have you in the server!"
+                        )
+                    except discord.HTTPException as e:
+                        print(f"⚠️ Couldn't send welcome message: {e}")
+        else:
+            embed.color = PURPLE
+            embed.add_field(name="Rejected", value=f"❌ {interaction.user.mention}", inline=False)
+            embed.set_footer(text="Rejected ❌")
+            await interaction.edit_original_response(embed=embed, view=verify_view(self.member_id, disabled=True))
 
 
-# ================================================================
-# WARNING CLEARED CARD
-# ================================================================
-async def post_warning_cleared_card(guild, member, punisher, reason, cleared_cases=None):
-    """Posts the green WARNING CLEARED card to its channel."""
-    cleared_cases = list(cleared_cases or [])
-    case_no = next_case()
-    date_text = discord.utils.utcnow().strftime("%d/%m/%Y")
-
-    try:
-        avatar_bytes = await member.display_avatar.replace(size=256, format="png").read()
-    except Exception as e:
-        print(f"⚠️ Couldn't fetch avatar for warning-clear card {member}: {e}")
-        avatar_bytes = None
-
-    user_name, punisher_name = card_name(member), card_name(punisher)
-    max_bytes = min(MAX_BYTES, int(guild.filesize_limit * 0.9))
-
-    try:
-        card_bytes = await asyncio.to_thread(
-            render_card_gif, user_name, punisher_name, reason, "WARNING CLEARED",
-            case_no, date_text, avatar_bytes, max_bytes,
-        )
-        ext = "gif"
-    except Exception as e:
-        print(f"⚠️ Warning-clear GIF failed ({type(e).__name__}: {e}) — falling back to PNG")
-        try:
-            card_bytes = await asyncio.to_thread(
-                render_card, user_name, punisher_name, reason, "WARNING CLEARED",
-                case_no, date_text, avatar_bytes,
-            )
-            ext = "png"
-        except Exception as e2:
-            print(f"❌ Failed to render warning-clear card: {type(e2).__name__}: {e2}")
-            return False
-
-    punishment_records[case_no] = {
-        "user_id": member.id,
-        "user_tag": str(member),
-        "punisher_id": punisher.id,
-        "punisher_tag": str(punisher),
-        "reason": reason,
-        "type": "WARNING CLEARED",
-        "display_type": "WARNING CLEARED",
-        "date_text": date_text,
-        "cleared_warning_cases": cleared_cases,
-    }
-    save_db()
-
-    channel = guild.get_channel(WARNING_CLEAR_CHANNEL_ID)
-    if channel is None:
-        print(f"❌ Warning cleared channel {WARNING_CLEAR_CHANNEL_ID} was not found.")
-        return False
-
-    file = discord.File(io.BytesIO(card_bytes), filename=f"warning_cleared_{case_no:04d}.{ext}")
+def verify_view(member_id: int, disabled: bool = False) -> discord.ui.View:
     view = discord.ui.View(timeout=None)
-    view.add_item(PunishmentDetailsButton(case_no))
-
-    try:
-        await send_with_retry(channel, file=file, view=view)
-        print(f"🟢 WARNING CLEARED case ELT-{case_no:04d} posted for {member}")
-        return True
-    except Exception as e:
-        print(f"❌ Failed to send warning-clear card: {e}")
-        return False
+    view.add_item(VerifyButton("accept", member_id, disabled))
+    view.add_item(VerifyButton("reject", member_id, disabled))
+    return view
 
 
-# ================================================================
-# NORMAL PUNISHMENT CARD
-# ================================================================
-async def issue_punishment(
-    interaction: discord.Interaction,
-    member: discord.abc.User,
-    ptype: str,
-    reason: str,
-    *,
-    card_ptype: str = None,
-    record_extra: dict = None,
-    confirm_note: str = "",
-    severity: int = None,
-):
-    """
-    Renders + posts the card and saves the case.
-    Returns the case number on success, or None if it failed.
-    card_ptype lets a 3rd warning DISPLAY as BAN while the record stays WARNING.
-    severity overrides the card's severity bar (warnings: 33 / 66 / 100).
-    """
-    case_no = next_case()
-    render_type = (card_ptype or ptype).upper()
-
-    try:
-        avatar_bytes = await member.display_avatar.replace(size=256, format="png").read()
-    except Exception as e:
-        print(f"⚠️ Couldn't fetch avatar for {member}: {e}")
-        avatar_bytes = None
-
-    date_text = discord.utils.utcnow().strftime("%d/%m/%Y")
-    user_name, punisher_name = card_name(member), card_name(interaction.user)
-    max_bytes = min(MAX_BYTES, int(interaction.guild.filesize_limit * 0.9))
-
-    try:
-        card_bytes = await asyncio.to_thread(
-            render_card_gif, user_name, punisher_name, reason, render_type,
-            case_no, date_text, avatar_bytes, max_bytes, severity,
-        )
-        ext = "gif"
-    except Exception as e:
-        print(f"⚠️ Animated card failed ({type(e).__name__}: {e}) — falling back to the still card")
-        try:
-            card_bytes = await asyncio.to_thread(
-                render_card, user_name, punisher_name, reason, render_type,
-                case_no, date_text, avatar_bytes, severity,
-            )
-            ext = "png"
-        except Exception as e2:
-            print(f"❌ Failed to render punishment card: {type(e2).__name__}: {e2}")
-            await interaction.followup.send(
-                f"⚠️ {bold('Something went wrong generating the punishment card.')}", ephemeral=True
-            )
-            return None
-
-    punishment_records[case_no] = {
-        "user_id": member.id,
-        "user_tag": str(member),
-        "punisher_id": interaction.user.id,
-        "punisher_tag": str(interaction.user),
-        "reason": reason,
-        "type": ptype,
-        "display_type": render_type,
-        "date_text": date_text,
-    }
-    if record_extra:
-        punishment_records[case_no].update(record_extra)
-    save_db()
-
-    log_channel = get_log_channel(interaction)
-    file = discord.File(io.BytesIO(card_bytes), filename=f"punishment_case_{case_no:04d}.{ext}")
-    view = discord.ui.View(timeout=None)
-    view.add_item(PunishmentDetailsButton(case_no))
-
-    try:
-        await send_with_retry(log_channel, file=file, view=view)
-        print(f"✅ Case ELT-{case_no:04d} ({ptype}/{render_type}) posted for {member} by {interaction.user}")
-    except Exception as e:
-        print(f"❌ Failed to send punishment card: {e}")
-        await interaction.followup.send(
-            f"⚠️ {bold('The case was saved but I could not post the card — check my permissions in that channel.')}",
-            ephemeral=True,
-        )
-        return case_no   # the punishment itself IS recorded
-
-    text = f"✅ {bold(f'{ptype.title()} logged for')} {member.mention} {bold('in')} {log_channel.mention}."
-    if confirm_note:
-        text += f" {confirm_note}"
-    await interaction.followup.send(text, ephemeral=True)
-    return case_no
+# ====================== MOD panel (help alerts) ======================
+def _is_claimed(embed: discord.Embed) -> bool:
+    return get_field(embed, "Claimed by") is not None
 
 
-async def reject(interaction: discord.Interaction, command: str, target: discord.abc.User, msg: str):
-    print(f"🚫 /{command}: {interaction.user} -> {target} blocked: {msg}")
-    await interaction.followup.send(f"⚠️ {bold(msg)}", ephemeral=True)
+def _alert_origin(msg: discord.Message) -> str:
+    """'panel' if the request was sent from #describe-issue by someone who is not in a voice channel."""
+    if msg.embeds:
+        value = get_field(msg.embeds[0], "Voice Channel") or ""
+        if "Not in a voice channel" in value:
+            return "panel"
+    return "vc"
 
 
-# ================================================================
-# WARNING EXPIRATION
-# ================================================================
-async def expire_warnings():
-    """No new warning for WARNING_EXPIRE_DAYS -> the whole active streak is cleared."""
+def notify_member(member_id: int, text: str):
+    """Short self-deleting @mention in #describe-issue (used for members who are not in voice)."""
     guild = bot.get_guild(GUILD_ID)
     if guild is None:
         return
+    member = guild.get_member(member_id)
+    channel = guild.get_channel(MEMBER_HELP_PANEL_CHANNEL_ID)
+    if member is None or not isinstance(channel, discord.TextChannel):
+        return
+    task = asyncio.create_task(ping_member(channel, member, text, NOTIFY_DELETE_AFTER))
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
 
-    now = datetime.now(timezone.utc)
-    by_member: dict[int, list] = {}
-    for case_no, record in punishment_records.items():
-        if _warning_is_active(record):
-            by_member.setdefault(record["user_id"], []).append((case_no, record))
 
-    changed = False
+async def resolve_alert(interaction: discord.Interaction, member_id: int, note: str | None = None):
+    message = interaction.message
+    if message is None or not message.embeds:
+        return await interaction.response.send_message("Couldn't find the alert message.", ephemeral=True)
+    if _already_done(message, ALERT_DONE_FOOTERS):
+        return await interaction.response.send_message("This request was already closed.", ephemeral=True)
 
-    for member_id, records in by_member.items():
-        latest = max(
-            records,
-            key=lambda item: (_parse_warning_time(item[1]) or datetime.min.replace(tzinfo=timezone.utc), item[0]),
-        )
-        latest_time = _parse_warning_time(latest[1])
+    embed = message.embeds[0].copy()
+    embed.color = PURPLE
+    if note:
+        set_field(embed, "What happened", f">>> {note}"[:1024], inline=False)
+    set_field(embed, "Status", ALERT_STATUS["Resolved"], inline=True)
+    set_field(embed, "Resolved by", interaction.user.mention, inline=True)
+    embed.set_footer(text="Resolved", icon_url=embed.footer.icon_url)
+    await interaction.response.edit_message(embed=embed, view=help_view(member_id, disabled=True))
 
-        # Old records have no exact timestamp — don't guess their expiry.
-        if latest_time is None or now - latest_time < timedelta(days=WARNING_EXPIRE_DAYS):
-            continue
+    await close_help_request(
+        member_id,
+        f"🟢 Resolved by {interaction.user.mention}",
+        PURPLE,
+        notify=f"your request was resolved by {interaction.user.mention}. Thank you for your patience!",
+    )
 
-        cleared_cases = []
-        for case_no, record in records:
-            record["warning_active"] = False
-            record["warning_cleared_at"] = now.isoformat()
-            record["warning_clear_method"] = "automatic_30_day_expiry"
-            cleared_cases.append(case_no)
-        changed = True
-        save_db()   # saved BEFORE posting, so a crash can never post the same clear twice
 
-        member = guild.get_member(member_id)
-        if member is None:
-            continue   # left the server: cleared quietly, nothing to announce
+class ResolveNoteModal(discord.ui.Modal, title="Resolve Help Request"):
+    note = discord.ui.TextInput(
+        label="What was the problem? (optional)",
+        style=discord.TextStyle.paragraph,
+        placeholder="What happened / why they needed help...",
+        required=False,
+        max_length=500,
+    )
 
-        try:
-            await update_warning_roles(guild, member, 0)
-            reason = (
-                f"No new warning was received for {WARNING_EXPIRE_DAYS} days. "
-                f"All active warnings were automatically cleared."
+    def __init__(self, member_id: int):
+        super().__init__()
+        self.member_id = member_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await resolve_alert(interaction, self.member_id, self.note.value or None)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        print(f"❌ Resolve modal error: {error}")
+        if not interaction.response.is_done():
+            await interaction.response.send_message("Something went wrong. Please try again.", ephemeral=True)
+
+
+class HelpButton(
+    discord.ui.DynamicItem[discord.ui.Button],
+    template=r"help_(?P<action>claim|resolved|note)_(?P<uid>[0-9]+)",
+):
+    def __init__(self, action: str, member_id: int, disabled: bool = False):
+        if action == "claim":
+            label, style = "Claim", discord.ButtonStyle.secondary
+        elif action == "resolved":
+            label, style = "Mark as Resolved", discord.ButtonStyle.secondary
+        else:
+            label, style = "Resolve", discord.ButtonStyle.secondary
+        super().__init__(
+            discord.ui.Button(
+                label=label,
+                style=style,
+                custom_id=f"help_{action}_{member_id}",
+                disabled=disabled,
             )
-            punisher = guild.me or bot.user
-            if punisher:
-                await post_warning_cleared_card(guild, member, punisher, reason, cleared_cases)
-        except Exception:
-            print(f"❌ Expiry follow-up failed for {member_id}:")
-            traceback.print_exc()
+        )
+        self.action = action
+        self.member_id = member_id
 
-    if changed:
-        save_db()
+    @classmethod
+    async def from_custom_id(cls, interaction: discord.Interaction, item: discord.ui.Button, match, /):
+        return cls(match["action"], int(match["uid"]))
+
+    async def callback(self, interaction: discord.Interaction):
+        message = interaction.message
+        if message is None or not message.embeds:
+            return await interaction.response.send_message("Couldn't find the alert message.", ephemeral=True)
+        if _already_done(message, ALERT_DONE_FOOTERS):
+            return await interaction.response.send_message("This request was already closed.", ephemeral=True)
+
+        if self.action == "resolved":
+            await resolve_alert(interaction, self.member_id)
+
+        elif self.action == "note":
+            await interaction.response.send_modal(ResolveNoteModal(self.member_id))
+
+        else:  # claim
+            embed = message.embeds[0].copy()
+            claimed_by = get_field(embed, "Claimed by")
+            if claimed_by:
+                return await interaction.response.send_message(
+                    f"Already claimed by {claimed_by}.", ephemeral=True
+                )
+            embed.color = PURPLE
+            set_field(embed, "Status", "🟣 `Claimed`", inline=True)
+            set_field(embed, "Claimed by", interaction.user.mention, inline=True)
+            await interaction.response.edit_message(embed=embed, view=help_view(self.member_id, claimed=True))
+
+            entry = help_panels.get(self.member_id)
+            if entry is not None:
+                entry["claimed"] = True
+            await set_panel_status(
+                self.member_id,
+                f"🟣 {interaction.user.mention} is handling your request",
+                PURPLE,
+            )
+            # A member who is not in voice has no other way to know -> short ping in #describe-issue.
+            if entry is not None and entry.get("origin") == "panel":
+                notify_member(
+                    self.member_id,
+                    f"{interaction.user.mention} picked up your request and will contact you shortly.",
+                )
 
 
-@tasks.loop(hours=1)
-async def warning_expiry_loop():
-    try:
-        await expire_warnings()
-    except Exception:
-        print("❌ warning expiry run failed (it will retry next hour):")
-        traceback.print_exc()
+def help_view(member_id: int, claimed: bool = False, disabled: bool = False) -> discord.ui.View:
+    view = discord.ui.View(timeout=None)
+    view.add_item(HelpButton("claim", member_id, disabled or claimed))
+    view.add_item(HelpButton("note", member_id, disabled))
+    return view
 
 
-@warning_expiry_loop.before_loop
-async def _wait_ready_for_warning_expiry():
-    await bot.wait_until_ready()
+class IssueReportView(discord.ui.View):
+    def __init__(self, seen: bool = False):
+        super().__init__(timeout=None)
+        if seen:
+            self.mark_seen.label = "Seen"
+            self.mark_seen.disabled = True
+
+    @discord.ui.button(label="Mark as Seen", style=discord.ButtonStyle.secondary, custom_id="issue_report_seen")
+    async def mark_seen(self, interaction: discord.Interaction, button: discord.ui.Button):
+        embed = interaction.message.embeds[0].copy()
+        if any(f.name == "Seen by" for f in embed.fields):
+            return await interaction.response.send_message("Already marked as seen.", ephemeral=True)
+        embed.color = PURPLE
+        set_field(embed, "Status", "🟢 `Seen`", inline=True)
+        set_field(embed, "Seen by", interaction.user.mention, inline=True)
+        set_field(embed, "Seen At", discord.utils.format_dt(discord.utils.utcnow(), "R"), inline=True)
+        await interaction.response.edit_message(embed=embed, view=IssueReportView(seen=True))
 
 
-# ================================================================
-# BLACKLIST HELPERS
-# ================================================================
-def removable_roles(member: discord.Member):
-    """Roles /blacklist takes away: everything except @everyone, the blacklist role, the Super Member
-    role (KEEP_ROLE_IDS) and Discord-managed roles (Server Booster, bot roles) which can't be removed anyway."""
-    return [
-        r for r in member.roles
-        if not r.is_default() and not r.managed and r.id != BLACKLIST_ROLE_ID and r.id not in KEEP_ROLE_IDS
-    ]
+# ====================== MEMBER panel (ONE shared panel for everyone) ======================
+def build_shared_embed(guild: discord.Guild) -> discord.Embed:
+    """The single panel in #describe-issue. The queue lists everyone who has SENT an issue."""
+    queue = sorted(
+        ((mid, e) for mid, e in help_panels.items() if e.get("show") and e.get("queued")),
+        key=lambda item: item[1].get("queued_at") or item[1]["joined_at"],
+    )
+    if queue:
+        lines = [
+            f"**{i}.** <@{mid}> — {e['status']} • {discord.utils.format_dt(e.get('queued_at') or e['joined_at'], 'R')}"
+            for i, (mid, e) in enumerate(queue[:15], start=1)
+        ]
+        if len(queue) > 15:
+            lines.append(f"*…and {len(queue) - 15} more*")
+        queue_text = "\n".join(lines)
+    else:
+        queue_text = "*Nobody is waiting right now.*"
+
+    embed = discord.Embed(
+        title=PANEL_TITLE,
+        description=(
+            "## Moderator Support\n"
+            "Need help from a **moderator**? Press **Describe Issue** below and tell us what is wrong — "
+            "**you do not need to join a voice channel.** You are added to the queue the moment you send it, "
+            "and a moderator will pick it up as soon as one is available.\n"
+            "\n"
+            "### How it works\n"
+            "**1.** Press **Describe Issue** and tell us what happened, who is involved and when it happened.\n"
+            "**2.** You appear in the **Current queue** below. You get a short ping here when a moderator picks up your request.\n"
+            "**3.** Press **Cancel Request** if you no longer need help.\n"
+            "\n"
+            "*Prefer to talk? You can also wait in the **Waiting for Help** voice channel.*\n"
+            "\n"
+            "### Current queue\n"
+            f"{queue_text}"
+        ),
+        color=PURPLE,
+    )
+    embed.set_footer(
+        text="ELITE LEADERS COMMUNITY • Support System",
+        icon_url=guild.icon.url if guild.icon else None,
+    )
+    embed.timestamp = discord.utils.utcnow()
+    return embed
 
 
-def kept_roles(member: discord.Member):
-    """Roles a blacklisted member keeps next to the blacklist role."""
-    return [r for r in member.roles if not r.is_default() and (r.managed or r.id in KEEP_ROLE_IDS)]
-
-
-async def lock_blacklist_roles(member: discord.Member, reason: str):
-    """Makes the member's roles exactly: blacklist role + the roles they keep (Super Member, managed roles)."""
-    role = member.guild.get_role(BLACKLIST_ROLE_ID)
-    if role is None:
-        raise RuntimeError("blacklist role not found")
-    await member.edit(roles=kept_roles(member) + [role], reason=reason[:512])
-
-
-# ================================================================
-# SLASH COMMAND SYNC
-# ================================================================
-async def sync_commands() -> bool:
-    for attempt in range(1, 6):
+async def refresh_shared_panel(guild: discord.Guild):
+    global shared_panel
+    channel = guild.get_channel(MEMBER_HELP_PANEL_CHANNEL_ID)
+    if not isinstance(channel, discord.TextChannel):
+        print("⚠️ Couldn't find the #describe-issue channel — check MEMBER_HELP_PANEL_CHANNEL_ID")
+        return
+    async with _panel_lock:
+        embed = build_shared_embed(guild)
+        if shared_panel is not None:
+            try:
+                await shared_panel.edit(content=None, embed=embed, view=panel_view())
+                return
+            except discord.NotFound:
+                shared_panel = None
+            except discord.HTTPException as e:
+                print(f"⚠️ Failed to update the shared panel: {e}")
+                return
         try:
-            synced = await bot.tree.sync(guild=GUILD)
-            print(f"🔄 Synced {len(synced)} slash command(s) to guild {GUILD_ID}")
-            return True
+            shared_panel = await send_with_retry(channel, embed=embed, view=panel_view())
+            print("✅ Shared support panel sent")
         except Exception as e:
-            print(f"❌ Sync failed (attempt {attempt}/5): {e}")
-            await asyncio.sleep(5 * attempt)
-    return False
+            print(f"❌ Failed to send the shared panel: {e}")
 
 
-@tasks.loop(hours=6)
-async def resync_loop():
+async def ensure_shared_panel(guild: discord.Guild):
+    global shared_panel
+    channel = guild.get_channel(MEMBER_HELP_PANEL_CHANNEL_ID)
+    if not isinstance(channel, discord.TextChannel):
+        return
+    found = []
     try:
-        await sync_commands()
-    except Exception:
-        traceback.print_exc()
+        async for msg in channel.history(limit=100):
+            if msg.author.id == bot.user.id and msg.embeds and "Support Request Received" in (msg.embeds[0].title or ""):
+                found.append(msg)
+    except (discord.Forbidden, discord.HTTPException) as e:
+        print(f"⚠️ Couldn't read #describe-issue history (needs 'Read Message History'): {e}")
+    if found:
+        shared_panel = found[0]
+        for old in found[1:]:
+            try:
+                await old.delete()
+            except discord.HTTPException:
+                pass
+    await refresh_shared_panel(guild)
 
 
-@resync_loop.before_loop
-async def _wait_ready():
-    await bot.wait_until_ready()
+async def ping_member(channel: discord.TextChannel, member: discord.Member, text: str | None = None,
+                      delete_after: float = PING_DELETE_AFTER):
+    """Short @mention message so the member gets a notification; it deletes itself."""
+    try:
+        msg = await channel.send(
+            f"{member.mention} {text or 'your request is in — check the panel.'}",
+            allowed_mentions=discord.AllowedMentions(users=[member]),
+        )
+        await asyncio.sleep(delete_after)
+        await msg.delete()
+    except discord.HTTPException:
+        pass
 
 
+async def set_panel_status(member_id: int, status: str, color: discord.Color | None = None, note: str | None = None):
+    entry = help_panels.get(member_id)
+    if entry is None:
+        return
+    entry["status"] = status
+    guild = bot.get_guild(GUILD_ID)
+    if guild:
+        await refresh_shared_panel(guild)
+
+
+async def close_help_request(
+    member_id: int,
+    status: str,
+    color: discord.Color,
+    alert_footer: str | None = None,
+    skip_panel: bool = False,
+    note: str | None = None,
+    lock_alert: bool = True,
+    notify: str | None = None,
+):
+    """Finishes a help request: the member is removed from the queue. If `alert_footer` is given
+    the mod alert is updated too. `notify` sends a short ping to members who are not in voice."""
+    entry = help_panels.pop(member_id, None)
+    if entry is None:
+        return
+
+    alert = entry.get("alert")
+    if alert_footer and alert is not None:
+        try:
+            fresh = await alert.channel.fetch_message(alert.id)
+            if fresh.embeds and fresh.embeds[0].footer.text not in ALERT_DONE_FOOTERS:
+                embed = fresh.embeds[0].copy()
+                embed.color = color
+                set_field(embed, "Status", ALERT_STATUS.get(alert_footer, alert_footer), inline=True)
+                embed.set_footer(text=alert_footer, icon_url=embed.footer.icon_url)
+                if lock_alert:
+                    view = help_view(member_id, disabled=True)
+                else:
+                    view = help_view(member_id, claimed=_is_claimed(embed))
+                await fresh.edit(embed=embed, view=view)
+        except discord.NotFound:
+            pass
+        except discord.HTTPException as e:
+            print(f"⚠️ Failed to update mod alert: {e}")
+
+    if notify and entry.get("origin") == "panel":
+        notify_member(member_id, notify)
+
+    guild = bot.get_guild(GUILD_ID)
+    if guild:
+        await refresh_shared_panel(guild)
+
+
+# ====================== Recovery (restarts) + leave grace period ======================
+def entry_from_alert(msg: discord.Message, config: dict, origin: str = "vc") -> dict:
+    """Rebuilds a help_panels entry from an alert message that is still open."""
+    embed = msg.embeds[0]
+    claimed_by = get_field(embed, "Claimed by")
+    issue = get_field(embed, "Issue")
+    described = bool(issue) and "hasn't described" not in issue
+    if claimed_by:
+        status = f"🟣 {claimed_by} is handling your request"
+    elif described:
+        status = "🟡 Message sent — waiting for a moderator"
+    else:
+        status = "🟡 Waiting for a moderator"
+    return {
+        "alert": msg,
+        "origin": origin,
+        "described": described,
+        "queued": described or origin == "panel",
+        "claimed": bool(claimed_by),
+        "show": config.get("send_member_panel", True),
+        "status": status,
+        "joined_at": msg.created_at,
+        "queued_at": msg.created_at,
+    }
+
+
+async def scan_latest_alerts(channel) -> dict[int, discord.Message]:
+    latest: dict[int, discord.Message] = {}
+    try:
+        async for msg in channel.history(limit=100):
+            if msg.author.id != bot.user.id or not msg.embeds:
+                continue
+            for row in msg.components:
+                for c in getattr(row, "children", []):
+                    m = re.fullmatch(r"help_(?:claim|resolved|note)_(\d+)", getattr(c, "custom_id", None) or "")
+                    if m:
+                        latest.setdefault(int(m.group(1)), msg)
+    except (discord.Forbidden, discord.HTTPException) as e:
+        print(f"⚠️ Couldn't read the help alert channel history: {e}")
+    return latest
+
+
+def _alert_is_open(msg: discord.Message) -> bool:
+    footer = msg.embeds[0].footer.text if msg.embeds else None
+    return footer not in ALERT_DONE_FOOTERS and footer != "Member moved"
+
+
+async def recover_help_request_for(member: discord.Member) -> bool:
+    """Used when a member presses a panel button but the bot has no record of their request
+    (for example after a restart). Re-attaches their still-open mod alert. Never creates a new alert."""
+    channel = member.guild.get_channel(HELP_ALERT_CHANNEL_ID)
+    if channel is None:
+        return False
+    msg = (await scan_latest_alerts(channel)).get(member.id)
+    if msg is None or not _alert_is_open(msg):
+        return False
+    origin = _alert_origin(msg)
+    vc = member.voice.channel if member.voice else None
+    in_help = vc is not None and vc.id in HELP_VC_CONFIG
+    if origin == "vc" and not in_help:
+        return False
+    config = HELP_VC_CONFIG[vc.id] if in_help else DEFAULT_HELP_CONFIG
+    if member.id not in help_panels:
+        help_panels[member.id] = entry_from_alert(msg, config, origin)
+        await refresh_shared_panel(member.guild)
+    return True
+
+
+async def recover_help_requests(guild: discord.Guild):
+    """Runs once at startup so a restart / redeploy never loses the queue."""
+    alert_channel = guild.get_channel(HELP_ALERT_CHANNEL_ID)
+    if alert_channel is None:
+        return
+    latest = await scan_latest_alerts(alert_channel)
+
+    waiting: dict[int, tuple[discord.Member, discord.abc.GuildChannel]] = {}
+    for vc_id in HELP_VC_CONFIG:
+        vc = guild.get_channel(vc_id)
+        if isinstance(vc, (discord.VoiceChannel, discord.StageChannel)):
+            for m in vc.members:
+                if not m.bot:
+                    waiting[m.id] = (m, vc)
+
+    for mid, msg in latest.items():
+        if mid in waiting or not _alert_is_open(msg):
+            continue
+        if _alert_origin(msg) == "panel" and guild.get_member(mid) is not None:
+            # Sent from #describe-issue by someone who isn't in voice -> still a live request.
+            help_panels[mid] = entry_from_alert(msg, DEFAULT_HELP_CONFIG, "panel")
+            print(f"♻️ Recovered panel request for {mid}")
+            continue
+        try:
+            embed = msg.embeds[0].copy()
+            embed.color = PURPLE
+            set_field(embed, "Status", ALERT_STATUS["Member left"], inline=True)
+            embed.set_footer(text="Member left", icon_url=embed.footer.icon_url)
+            await msg.edit(embed=embed, view=help_view(mid, disabled=True))
+        except discord.HTTPException:
+            pass
+
+    for mid, (m, vc) in waiting.items():
+        msg = latest.get(mid)
+        config = HELP_VC_CONFIG[vc.id]
+        if msg is not None and _alert_is_open(msg):
+            help_panels[mid] = entry_from_alert(msg, config, _alert_origin(msg))
+            print(f"♻️ Recovered help request for {m}")
+        elif msg is not None and msg.embeds and msg.embeds[0].footer.text in ("Resolved", "Resolved ✅", "Resolved ☑️"):
+            continue
+        else:
+            print(f"♻️ {m} is waiting with no open alert — sending one")
+            await send_help_alert(m, vc, config, ping=False)
+
+
+async def close_after_grace(member_id: int):
+    """Closes a request only if the member did NOT come back within HELP_LEAVE_GRACE seconds."""
+    try:
+        await asyncio.sleep(HELP_LEAVE_GRACE)
+    except asyncio.CancelledError:
+        return
+    _leave_tasks.pop(member_id, None)
+    guild = bot.get_guild(GUILD_ID)
+    m = guild.get_member(member_id) if guild else None
+    if m and m.voice and m.voice.channel and m.voice.channel.id in HELP_VC_CONFIG:
+        return
+    await close_help_request(member_id, "🔴 Left the queue", PURPLE, alert_footer="Member left")
+
+
+class DescribeIssueModal(discord.ui.Modal, title="Describe Your Issue"):
+    issue = discord.ui.TextInput(
+        label="What do you need help with?",
+        style=discord.TextStyle.paragraph,
+        placeholder="What happened, who is involved, and when? A few lines is enough.",
+        required=True,
+        max_length=500,
+    )
+
+    def __init__(self, member_id: int):
+        super().__init__()
+        self.member_id = member_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.send_message(
+            "Got it, thanks. You are now in the queue — a moderator will pick up your request shortly. "
+            "You will get a ping in this channel when someone is on it.",
+            ephemeral=True,
+        )
+
+        guild = interaction.guild
+        member = guild.get_member(self.member_id) if guild else None
+        reports_channel = guild.get_channel(ISSUE_REPORTS_CHANNEL_ID) if guild else None
+        text = self.issue.value
+        now = discord.utils.utcnow()
+
+        entry = help_panels.get(self.member_id)
+        created_here = False
+
+        if entry is None and member is not None:
+            # No request yet (the member is NOT in the help voice channel) -> open one from the panel.
+            vc = member.voice.channel if member.voice and member.voice.channel and member.voice.channel.id in HELP_VC_CONFIG else None
+            config = HELP_VC_CONFIG[vc.id] if vc else DEFAULT_HELP_CONFIG
+            if reserve_help_request(member, config, "vc" if vc else "panel"):
+                entry = help_panels[self.member_id]
+                entry.update(described=True, queued=True, queued_at=now, status="🟡 Message sent — waiting for a moderator")
+                created_here = True
+                await _post_help_alert(member, vc, config, ping=False, issue=text)
+                entry = help_panels.get(self.member_id)   # None if it was closed in the meantime
+            else:
+                entry = help_panels.get(self.member_id)
+
+        if entry is not None and not created_here:
+            # The alert may still be posting (member just joined the voice channel) -> wait a moment.
+            for _ in range(10):
+                if entry.get("alert") is not None:
+                    break
+                await asyncio.sleep(0.5)
+            entry["described"] = True
+            if not entry.get("queued"):
+                entry["queued"] = True
+                entry["queued_at"] = now
+            alert = entry.get("alert")
+            if alert is not None:
+                try:
+                    fresh = await alert.channel.fetch_message(alert.id)
+                    if fresh.embeds and fresh.embeds[0].footer.text not in ALERT_DONE_FOOTERS:
+                        embed = fresh.embeds[0].copy()
+                        set_field(embed, "Issue", f">>> {text}"[:1024], inline=False)
+                        await fresh.edit(embed=embed, view=help_view(self.member_id, claimed=_is_claimed(embed)))
+                except discord.HTTPException as e:
+                    print(f"⚠️ Couldn't add the issue to the mod alert: {e}")
+
+            if not entry.get("claimed"):
+                await set_panel_status(self.member_id, "🟡 Message sent — waiting for a moderator", PURPLE)
+            elif guild:
+                await refresh_shared_panel(guild)
+
+        # Also post it to the issue reports channel.
+        if reports_channel is None:
+            print("⚠️ Couldn't find the issue reports channel — check ISSUE_REPORTS_CHANNEL_ID")
+        else:
+            embed = discord.Embed(
+                title="Issue Report",
+                description=(
+                    f"## New issue from <@{self.member_id}>\n"
+                    "*Sent from the support panel.*\n"
+                    "\n"
+                    "### Their message\n"
+                    f">>> {text}"
+                ),
+                color=PURPLE,
+            )
+            if member:
+                embed.set_author(name=f"{member.display_name} ({member})", icon_url=member.display_avatar.url)
+            else:
+                embed.set_author(name=f"Unknown member ({self.member_id})")
+
+            voice = member.voice.channel if member and member.voice and member.voice.channel else None
+            alert_msg = entry.get("alert") if entry else None
+
+            embed.add_field(name="Member", value=f"<@{self.member_id}>", inline=True)
+            embed.add_field(name="User ID", value=f"`{self.member_id}`", inline=True)
+            embed.add_field(name="Submitted", value=discord.utils.format_dt(now, "R"), inline=True)
+            embed.add_field(name="Voice Channel", value=voice.mention if voice else "`Not in a voice channel`", inline=True)
+            embed.add_field(name="Status", value="🟡 `Not seen yet`", inline=True)
+            if alert_msg is not None:
+                embed.add_field(name="Help Request", value=f"[Jump to request]({alert_msg.jump_url})", inline=True)
+
+            embed.set_footer(
+                text="ELITE LEADERS COMMUNITY • Issue Reports",
+                icon_url=guild.icon.url if guild and guild.icon else None,
+            )
+            embed.timestamp = now
+            try:
+                await send_with_retry(reports_channel, embed=embed, view=IssueReportView())
+                print(f"✅ Issue report sent for {member or self.member_id}")
+            except Exception as e:
+                print(f"❌ Failed to send issue report: {e}")
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        print(f"❌ Describe-issue modal error: {error}")
+        if not interaction.response.is_done():
+            await interaction.response.send_message("Something went wrong. Please try again.", ephemeral=True)
+
+
+class MemberPanelButton(
+    discord.ui.DynamicItem[discord.ui.Button],
+    template=r"member_(?P<action>describe|cancel)(?:_[0-9]+)?",
+):
+    """Buttons on the ONE shared panel. They act for whoever pressed them."""
+
+    def __init__(self, action: str):
+        if action == "describe":
+            label, emoji = "Describe Issue", None
+        else:
+            label, emoji = "Cancel Request", CANCEL_EMOJI
+        super().__init__(
+            discord.ui.Button(
+                label=label,
+                emoji=emoji,
+                style=discord.ButtonStyle.secondary,
+                custom_id=f"member_{action}",
+            )
+        )
+        self.action = action
+
+    @classmethod
+    async def from_custom_id(cls, interaction: discord.Interaction, item: discord.ui.Button, match, /):
+        return cls(match["action"])
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if self.action == "describe":
+            return True   # anyone can open / update a request - no voice channel needed
+
+        entry = help_panels.get(interaction.user.id)
+        if entry is None:
+            member = interaction.guild.get_member(interaction.user.id) if interaction.guild else None
+            if member is not None and await recover_help_request_for(member):
+                entry = help_panels.get(interaction.user.id)
+        if entry is None:
+            await interaction.response.send_message(
+                "You don't have an active request. Press **Describe Issue** to open one — no voice channel needed.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    async def callback(self, interaction: discord.Interaction):
+        member_id = interaction.user.id
+        if self.action == "describe":
+            await interaction.response.send_modal(DescribeIssueModal(member_id))
+            return
+
+        await interaction.response.send_message(
+            "Your request has been cancelled. Press **Describe Issue** any time you need a **moderator**.",
+            ephemeral=True,
+        )
+        await close_help_request(
+            member_id,
+            "⚪ Cancelled",
+            PURPLE,
+            alert_footer="Cancelled",
+        )
+
+
+def panel_view() -> discord.ui.View:
+    view = discord.ui.View(timeout=None)
+    view.add_item(MemberPanelButton("describe"))
+    view.add_item(MemberPanelButton("cancel"))
+    return view
+
+
+# ================================ Events ================================
 @bot.event
 async def setup_hook():
-    bot.add_dynamic_items(PunishmentDetailsButton)
-    resync_loop.start()
-    warning_expiry_loop.start()
+    bot.add_dynamic_items(VerifyButton, HelpButton, MemberPanelButton)
+    bot.add_view(IssueReportView())
 
 
-@bot.command(name="sync")
-@commands.guild_only()
-@commands.has_guild_permissions(administrator=True)
-async def sync_cmd(ctx: commands.Context):
-    ok = await sync_commands()
-    await ctx.reply("✅ Slash commands re-synced." if ok else "❌ Sync failed, check the logs.")
+async def nickname_watchdog():
+    """Every 15 seconds makes sure everyone in a waiting / help / report room has exactly the right emoji."""
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            guild = bot.get_guild(GUILD_ID)
+            if guild:
+                for vc in list(guild.channels):
+                    if not isinstance(vc, (discord.VoiceChannel, discord.StageChannel)):
+                        continue
+                    if vc.id not in ALERT_VC_IDS and not _is_report_room(vc):
+                        continue
+                    for m in list(vc.members):
+                        if m.bot or m.id in _nick_failed:
+                            continue
+                        want = _alert_emoji_for(m)
+                        if want and not _has_exact_prefix(m.nick, want):
+                            print(f"🔧 Watchdog: {m} has the wrong/missing emoji (want {want}), fixing")
+                            await set_report_vc_alert(m)
+        except Exception as e:
+            print(f"⚠️ Nickname watchdog error: {e}")
+        await asyncio.sleep(15)
 
 
 @bot.event
 async def on_ready():
+    global _startup_sync_done
     print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
-    print(f"👮 Staff role IDs: {sorted(STAFF_ROLE_IDS) or 'none set'}")
-    print(f"🛡️ Moderator role ID: {MOD_ROLE_ID}")
-    print(f"🔨 Who can ban: {TIER_LABEL[BAN_MIN_TIER]} | kick: {TIER_LABEL[KICK_MIN_TIER]} | blacklist: {TIER_LABEL[BLACKLIST_MIN_TIER]}")
-    print(f"⚠️ Warning expiration: {WARNING_EXPIRE_DAYS} days")
-    print(f"🟢 Warning cleared channel: {WARNING_CLEAR_CHANNEL_ID}")
-    print(f"💀 Blacklist banner: {'found' if os.path.exists(BANNER_PATH) else 'NOT FOUND at ' + BANNER_PATH}")
-
     guild = bot.get_guild(GUILD_ID)
-    if guild is not None:
-        if guild.get_role(WARN_1_ROLE_ID) is None or guild.get_role(WARN_2_ROLE_ID) is None:
-            print("⚠️ Warn 1 / Warn 2 role not found — check the role IDs")
-        if guild.get_channel(WARNING_CLEAR_CHANNEL_ID) is None:
-            print("⚠️ WARNING_CLEAR_CHANNEL_ID channel not found")
-        blk = guild.get_role(BLACKLIST_ROLE_ID)
-        if blk is None:
-            print("⚠️ Blacklist role not found — check BLACKLIST_ROLE_ID")
-        elif guild.me and blk >= guild.me.top_role:
-            print("⚠️ The Blacklist role is ABOVE my role — move my role higher or /blacklist will fail")
+    if not guild:
+        print(f"❌ Guild {GUILD_ID} not found!")
+        return
+
+    await cache_invites(guild)
+
+    if _startup_sync_done:
+        return
+    _startup_sync_done = True
+
+    watchdog_task = asyncio.create_task(nickname_watchdog())
+    _bg_tasks.add(watchdog_task)
+
+    if not guild.me.guild_permissions.manage_nicknames:
+        print("⚠️ The bot is missing the 'Manage Nicknames' permission — the ⏳/📛 nickname emoji will NOT work until you give it")
+
+    for vc_id in ALERT_VC_IDS:
+        channel = guild.get_channel(vc_id)
+        if isinstance(channel, (discord.VoiceChannel, discord.StageChannel)):
+            for waiting_member in channel.members:
+                if not waiting_member.bot:
+                    await set_report_vc_alert(waiting_member)
+        elif channel is not None:
+            print(f"⚠️ Channel {vc_id} is a {type(channel).__name__}, not a voice channel — skipping it")
+        else:
+            print(f"⚠️ Can't find voice channel {vc_id}")
+
+    report_category = guild.get_channel(REPORT_CATEGORY_ID)
+    if isinstance(report_category, discord.CategoryChannel):
+        for vc in list(report_category.voice_channels):
+            if not _is_report_room(vc):
+                continue
+            if vc.members:
+                for room_member in vc.members:
+                    if not room_member.bot:
+                        await set_report_vc_alert(room_member)
+            else:
+                await delete_if_empty_report_room(vc)
+
+    for m in list(guild.members):
+        if m.bot or _in_alert_vc(m):
+            continue
+        if _strip_alert_prefix(m.nick)[1]:
+            await set_report_vc_alert(m)
+
+    await ensure_shared_panel(guild)
+    await recover_help_requests(guild)
+    await refresh_shared_panel(guild)
+
+
+@bot.event
+async def on_invite_create(invite: discord.Invite):
+    if invite.guild and invite.guild.id == GUILD_ID:
+        await cache_invites(invite.guild)
+        print(f"📝 Invite created: {invite.code}")
+
+
+@bot.event
+async def on_invite_delete(invite: discord.Invite):
+    # Single-use invites vanish the moment they're used, so the cache must NOT be overwritten here.
+    if invite.guild and invite.guild.id == GUILD_ID:
+        print(f"🗑️ Invite deleted: {invite.code}")
 
 
 @bot.event
 async def on_member_join(member: discord.Member):
-    """Leaving and rejoining doesn't wash anything away: Blacklist / Warn roles come back."""
     if member.guild.id != GUILD_ID:
         return
 
-    if member.id in blacklist_records:
-        try:
-            await lock_blacklist_roles(member, "Blacklisted member rejoined")
-            print(f"💀 Blacklist role re-applied to {member} after rejoining")
-        except Exception as e:
-            print(f"❌ Couldn't re-apply the blacklist role to {member}: {e}")
-        return
-
-    count = active_warning_count(member.id)
-    if count:
-        await update_warning_roles(member.guild, member, min(count, MAX_WARNINGS - 1))
-
-
-@bot.event
-async def on_member_update(before: discord.Member, after: discord.Member):
-    """Blacklist lock: a blacklisted member keeps ONLY the blacklist role."""
-    if after.guild.id != GUILD_ID or after.id not in blacklist_records:
-        return
-    if before.roles == after.roles:
-        return
-
-    role = after.guild.get_role(BLACKLIST_ROLE_ID)
-    if role is None:
-        return
-    extras = [
-        r for r in after.roles
-        if not r.is_default() and not r.managed and r.id != role.id and r.id not in KEEP_ROLE_IDS
-    ]
-    if not extras and role in after.roles:
-        return   # already exactly right (this is also what our own edit looks like)
+    print(f"➕ {member} joined the server")
+    await asyncio.sleep(1)
 
     try:
-        await lock_blacklist_roles(after, "Blacklisted: roles are locked")
-        print(f"💀 Blacklist lock: reset the roles of {after}")
-    except discord.HTTPException as e:
-        print(f"❌ Blacklist lock failed for {after}: {e}")
-    except Exception as e:
-        print(f"❌ Blacklist lock error for {after}: {e}")
+        current_invites = await member.guild.invites()
+        current_by_code = {invite.code: invite for invite in current_invites}
+        old_cache = invite_cache.get(member.guild.id, {})
 
+        inviter = None
 
-@bot.event
-async def on_command_error(ctx: commands.Context, error: commands.CommandError):
-    if isinstance(error, (commands.CommandNotFound, commands.CheckFailure)):
-        return
-    print(f"❌ Prefix command error: {error}")
+        for invite in current_invites:
+            old_uses = old_cache.get(invite.code, {}).get("uses", 0)
+            if (invite.uses or 0) > old_uses:
+                inviter = invite.inviter
+                print(f"👤 {member} was invited by {inviter} (invite {invite.code})")
+                break
 
+        if inviter is None:
+            for code, old_invite in old_cache.items():
+                if code in current_by_code:
+                    continue
+                max_uses = old_invite.get("max_uses")
+                if max_uses and old_invite.get("uses", 0) == max_uses - 1:
+                    inviter = old_invite.get("inviter")
+                    print(f"👤 {member} was invited by {inviter} (invite {code}, used up and deleted)")
+                    break
 
-# ================================================================
-# /WARN
-# ================================================================
-@bot.tree.command(
-    name="warn",
-    description="Give a warning to a member. Warnings expire after 30 days without a new warning.",
-    guild=GUILD,
-)
-@app_commands.describe(member="The member being warned", reason="Why they're being warned")
-@app_commands.guild_only()
-@require_tier("staff")
-async def warn_cmd(interaction: discord.Interaction, member: discord.Member, reason: app_commands.Range[str, 1, 300]):
-    await interaction.response.defer(ephemeral=True)
+        if inviter:
+            member_inviters[member.id] = inviter
+        else:
+            print(f"❓ {member} joined via unknown invite (possibly vanity URL)")
+            member_inviters[member.id] = None
 
-    problem = target_problem(interaction, member, needs_bot_rank=False)
-    if problem:
-        return await reject(interaction, "warn", member, problem)
-    if member.id in blacklist_records:
-        return await reject(interaction, "warn", member, "That member is already blacklisted.")
-
-    guild = interaction.guild
-
-    # One warn at a time: counting, the card and the roles can't be raced by a second staff member.
-    async with warning_lock:
-        warning_count = active_warning_count(member.id) + 1
-        percent = warning_percent(warning_count)
-        auto_ban = warning_count >= MAX_WARNINGS and can_ban(interaction.user)
-
-        card_type = "BAN" if auto_ban else "WARNING"
-        card_reason = reason
-        if auto_ban:
-            card_reason = f"{reason} — {MAX_WARNINGS} active warnings reached. Automatic ban applied."[:300]
-
-        record_extra = {
-            "warning_active": True,
-            "warning_issued_at": discord.utils.utcnow().isoformat(),
-            "warning_count": warning_count,
-            "warning_percent": percent,
+        invite_cache[member.guild.id] = {
+            invite.code: {"uses": invite.uses or 0, "max_uses": invite.max_uses, "inviter": invite.inviter}
+            for invite in current_invites
         }
-        if auto_ban:
-            record_extra["automatic_ban"] = True
+    except discord.Forbidden:
+        print("⚠️ Bot doesn't have permission to view invites")
+    except discord.HTTPException as e:
+        print(f"⚠️ Failed to read invites: {e}")
 
-        case_no = await issue_punishment(
-            interaction, member, "WARNING", card_reason,
-            card_ptype=card_type,
-            record_extra=record_extra,
-            confirm_note="" if auto_ban else f"{bold('Active warnings:')} **{warning_count}/{MAX_WARNINGS}**.",
-            severity=None if auto_ban else percent,   # a BAN card keeps its own 100% bar
-        )
 
-        if case_no is None:
-            # Card failed before anything was saved: no record, so don't touch the roles.
+async def find_latest_verification(channel: discord.TextChannel, member_id: int) -> discord.Message | None:
+    try:
+        async for msg in channel.history(limit=100):
+            if msg.author.id != bot.user.id or not msg.embeds:
+                continue
+            ids = [
+                getattr(c, "custom_id", None) or ""
+                for row in msg.components for c in getattr(row, "children", [])
+            ]
+            if any(cid.startswith("verify_") and cid.endswith(f"_{member_id}") for cid in ids):
+                return msg
+    except (discord.Forbidden, discord.HTTPException) as e:
+        print(f"⚠️ Couldn't read the verification channel history: {e}")
+    return None
+
+
+async def send_verification_alert(member: discord.Member, voice_channel: discord.VoiceChannel):
+    lock = _verify_locks.setdefault(member.id, asyncio.Lock())
+    async with lock:
+        await _send_verification_alert(member, voice_channel)
+
+
+async def _send_verification_alert(member: discord.Member, voice_channel: discord.VoiceChannel):
+    unverified_role = member.guild.get_role(UNVERIFIED_ROLE_ID)
+    if unverified_role is None or unverified_role not in member.roles:
+        print(f"⏭️ Skipped {member}: no Unverified role")
+        return
+
+    verification_channel = member.guild.get_channel(VERIFICATION_CHANNEL_ID)
+    if verification_channel is None:
+        print("⚠️ Couldn't find the verification channel — check VERIFICATION_CHANNEL_ID")
+        return
+
+    existing = None
+    entry = verify_alerts.get(member.id)
+    if entry is not None:
+        try:
+            existing = await verification_channel.fetch_message(entry["message"].id)
+        except discord.NotFound:
+            existing = None
+            verify_alerts.pop(member.id, None)
+            entry = None
+        except discord.HTTPException:
+            existing = entry["message"]
+    if existing is None:
+        existing = await find_latest_verification(verification_channel, member.id)
+        if existing is not None:
+            entry = verify_alerts[member.id] = {"message": existing, "rejoins": 0, "last_edit": 0.0}
+
+    if existing is not None and existing.embeds:
+        if existing.embeds[0].footer.text == VERIFY_OPEN_FOOTER:
+            entry["rejoins"] = entry.get("rejoins", 0) + 1
+            print(f"⏭️ {member} re-joined, verification request already open (x{entry['rejoins']})")
+            if time.monotonic() - entry.get("last_edit", 0.0) >= 5:
+                try:
+                    embed = existing.embeds[0].copy()
+                    set_field(embed, "Re-joined the voice channel", f"`{entry['rejoins']}` time(s) since this request", inline=False)
+                    await existing.edit(embed=embed)
+                    entry["last_edit"] = time.monotonic()
+                except discord.HTTPException:
+                    pass
+            return
+        age = (discord.utils.utcnow() - existing.created_at).total_seconds()
+        if age < VERIFY_REALERT_COOLDOWN:
+            print(f"⏭️ {member} re-joined too soon after the last request was handled ({int(age)}s) — skipped")
             return
 
-        await update_warning_roles(guild, member, warning_count if auto_ban else min(warning_count, MAX_WARNINGS - 1))
+    print(f"📤 Sending verification message for {member}")
 
-    # ---- 3rd warning by someone allowed to ban: automatic ban ----
-    if auto_ban:
-        dm = await dm_member(
-            member, guild, f"You have been banned from {guild.name}", reason, 0xE53935,
-            f"You reached {MAX_WARNINGS} active warnings.",
-        )
-        try:
-            await member.ban(reason=audit_reason(
-                f"{MAX_WARNINGS} active warnings reached: {reason}", "automatically banned", bot.user
-            ))
-            print(f"🔨 Automatic ban applied to {member} after warning #{warning_count}")
-        except discord.Forbidden:
-            await undo_dm(dm)
-            print(f"❌ Automatic ban failed for {member}: bot lacks ban permission/hierarchy.")
-            await interaction.followup.send(
-                "⚠️ The BAN card was posted, but Discord refused the automatic ban. "
-                "Check my Ban Members permission and role position.",
-                ephemeral=True,
+    inviter = member_inviters.get(member.id)
+    invited_by_text = f"Invited by: {inviter.mention}" if inviter else "Invited by: Unknown (vanity URL or unknown invite)"
+    joined_text = discord.utils.format_dt(member.joined_at, "R") if member.joined_at else "Unknown"
+
+    warning_text = ""
+    if NEW_ACCOUNT_WARNING_DAYS:
+        account_age = discord.utils.utcnow() - member.created_at
+        if account_age < timedelta(days=NEW_ACCOUNT_WARNING_DAYS):
+            if account_age.days >= 1:
+                age_label = f"{account_age.days} day{'s' if account_age.days != 1 else ''} old"
+            else:
+                hours = max(account_age.seconds // 3600, 0)
+                age_label = "less than an hour old" if hours < 1 else f"{hours} hour{'s' if hours != 1 else ''} old"
+            warning_text = (
+                f"{WARN_EMOJI} **New account warning**\n"
+                f"> This account was created {discord.utils.format_dt(member.created_at, 'R')} "
+                f"(only **{age_label}**, under {NEW_ACCOUNT_WARNING_DAYS} days). "
+                f"Check them carefully before verifying.\n\n"
             )
-        except discord.HTTPException as e:
-            await undo_dm(dm)
-            print(f"❌ Automatic ban HTTPException for {member}: {e}")
-            await interaction.followup.send(f"⚠️ The BAN card was posted, but the automatic ban failed: {e}", ephemeral=True)
+
+    embed = discord.Embed(
+        title="Member awaiting verification",
+        description=(
+            f"{warning_text}"
+            f"Member: {member.mention}\n"
+            f"ID: `{member.id}`\n"
+            f"Account created: {discord.utils.format_dt(member.created_at, 'R')}\n"
+            f"Joined server: {joined_text}\n"
+            f"{invited_by_text}\n"
+            f"Joined voice channel: *{voice_channel.name}*"
+        ),
+        color=PURPLE,
+    )
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.set_footer(text=VERIFY_OPEN_FOOTER)
+
+    try:
+        sent = await send_with_retry(
+            verification_channel,
+            content="@everyone A member in the voice channel needs verification",
+            embed=embed,
+            view=verify_view(member.id),
+            allowed_mentions=discord.AllowedMentions(everyone=True),
+        )
+        verify_alerts[member.id] = {"message": sent, "rejoins": 0, "last_edit": 0.0}
+        print(f"✅ Verification message sent for {member}")
+    except Exception as e:
+        print(f"❌ Failed to send verification message: {e}")
+
+
+def reserve_help_request(member: discord.Member, config: dict, origin: str = "vc") -> bool:
+    """Creates the member's request entry right away (before any await), so a second event can never
+    start a second request. Returns False if they already have one.
+    The member only shows up in the panel queue once `queued` is True (= they sent their issue)."""
+    if member.id in help_panels:
+        return False
+    now = discord.utils.utcnow()
+    help_panels[member.id] = {
+        "alert": None,
+        "origin": origin,
+        "described": False,
+        "queued": False,
+        "claimed": False,
+        "show": config.get("send_member_panel", True),
+        "status": "🟡 Waiting for a moderator",
+        "joined_at": now,
+        "queued_at": None,
+    }
+    return True
+
+
+async def send_help_alert(member: discord.Member, voice_channel: discord.VoiceChannel, config: dict, ping: bool = True):
+    """Member joined the help voice channel: opens the mod alert. They are NOT listed in the queue
+    until they press Describe Issue and send their message."""
+    if not reserve_help_request(member, config, "vc"):
+        print(f"⏭️ {member} already has an active help request, skipping")
+        return
+    await _post_help_alert(member, voice_channel, config, ping)
+
+
+async def _post_help_alert(member: discord.Member, voice_channel, config: dict, ping: bool = True, issue: str | None = None):
+    """Posts the mod alert. `voice_channel` is None for requests sent from the panel by members
+    who are not in a voice channel."""
+    help_channel = member.guild.get_channel(HELP_ALERT_CHANNEL_ID)
+    if help_channel is None:
+        print("⚠️ Couldn't find the help alert channel — check HELP_ALERT_CHANNEL_ID")
+        help_panels.pop(member.id, None)
         return
 
-    # ---- normal warning: tell the member ----
-    await dm_member(
-        member, guild, f"You received a warning in {guild.name}", reason, 0xF5A623,
-        f"Active warnings: {warning_count}/{MAX_WARNINGS}. "
-        f"They clear after {WARNING_EXPIRE_DAYS} days without a new warning.",
-    )
+    emoji = config.get("emoji", "")
+    print(f"📤 Sending help alert for {member} ({'voice' if voice_channel else 'panel'})")
 
-    # ---- 3rd+ warning from someone who can't ban: no ban, ping the high rank ----
-    if warning_count >= MAX_WARNINGS:
-        admin_role = guild.get_role(ADMIN_ROLE_ID)
-        who = admin_role.mention if admin_role else "High rank"
-        try:
-            await get_log_channel(interaction).send(
-                f"{who} {member.mention} now has **{warning_count}** active warnings. "
-                f"The high rank needs to decide on a ban.",
-                allowed_mentions=discord.AllowedMentions(
-                    roles=[admin_role] if admin_role else False, users=False, everyone=False
-                ),
-            )
-        except discord.HTTPException as e:
-            print(f"⚠️ Couldn't post the 3rd-warning notice: {e}")
-
-        await interaction.followup.send(
-            f"ℹ️ {member.mention} now has **{warning_count}** active warnings. "
-            f"You can't ban, so I pinged the high rank.",
-            ephemeral=True,
-        )
-
-
-# ================================================================
-# /UNWARN
-# ================================================================
-@bot.tree.command(name="unwarn", description="Remove the most recent active warning from a member.", guild=GUILD)
-@app_commands.describe(member="The member whose latest warning should be removed", reason="Why the warning is being removed")
-@app_commands.guild_only()
-@require_tier("staff")
-async def unwarn_cmd(interaction: discord.Interaction, member: discord.Member, reason: app_commands.Range[str, 1, 300]):
-    await interaction.response.defer(ephemeral=True)
-
-    problem = target_problem(interaction, member, needs_bot_rank=False)
-    if problem:
-        return await reject(interaction, "unwarn", member, problem)
-
-    async with warning_lock:
-        active = active_warning_records(member.id)
-        if not active:
-            return await interaction.followup.send(f"ℹ️ {member.mention} has no active warnings.", ephemeral=True)
-
-        case_no, record = active[-1]   # newest only
-        record["warning_active"] = False
-        record["warning_cleared_at"] = discord.utils.utcnow().isoformat()
-        record["warning_cleared_by_id"] = interaction.user.id
-        record["warning_cleared_by_tag"] = str(interaction.user)
-        record["warning_clear_method"] = "manual_unwarn"
-        record["warning_clear_reason"] = reason
-        save_db()
-
-        remaining = active_warning_count(member.id)
-        await update_warning_roles(interaction.guild, member, min(remaining, MAX_WARNINGS - 1))
-
-    clear_reason = (
-        f"Warning ELT-{case_no:04d} was removed by {card_name(interaction.user)}. Reason: {reason}"
-    )[:300]
-    await post_warning_cleared_card(interaction.guild, member, interaction.user, clear_reason, [case_no])
-
-    await interaction.followup.send(
-        f"🟢 Warning ELT-{case_no:04d} removed from {member.mention}. Active warnings remaining: **{remaining}**.",
-        ephemeral=True,
-    )
-
-
-# ================================================================
-# /MUTE and /TIMEOUT
-# ================================================================
-async def _apply_timeout(interaction, member, duration, reason, command, ptype, shown_reason):
-    """Shared by /mute and /timeout."""
-    try:
-        await member.timeout(duration, reason=audit_reason(reason, ptype.lower(), interaction.user))
-    except discord.Forbidden:
-        return await reject(interaction, command, member, "I do not have permission to time out that member.")
-    except discord.HTTPException as e:
-        print(f"❌ /{command} HTTPException for {member}: {e}")
-        return await interaction.followup.send(f"⚠️ {bold('Failed to apply the timeout:')} {e}", ephemeral=True)
-
-    await dm_member(
-        member, interaction.guild, f"You were {ptype.lower()}d in {interaction.guild.name}"
-        if ptype == "MUTE" else f"You were timed out in {interaction.guild.name}",
-        reason, 0x8E6CFF, shown_reason,
-    )
-    await issue_punishment(interaction, member, ptype, f"{reason} ({shown_reason})")
-
-
-@bot.tree.command(name="mute", description="Time a member out and log a mute card.", guild=GUILD)
-@app_commands.describe(member="The member being muted", minutes="How long to mute them for, in minutes", reason="Why they're being muted")
-@app_commands.guild_only()
-@require_tier("mod")
-async def mute_cmd(
-    interaction: discord.Interaction,
-    member: discord.Member,
-    minutes: app_commands.Range[int, 1, 40320],
-    reason: app_commands.Range[str, 1, 300],
-):
-    await interaction.response.defer(ephemeral=True)
-    problem = target_problem(interaction, member)
-    if problem:
-        return await reject(interaction, "mute", member, problem)
-    await _apply_timeout(interaction, member, timedelta(minutes=minutes), reason, "mute", "MUTE", f"for {minutes}m")
-
-
-@bot.tree.command(name="timeout", description="Time a member out for minutes, hours or days and log a timeout card.", guild=GUILD)
-@app_commands.describe(member="The member being timed out", amount="How long (a number)", unit="Minutes, hours or days", reason="Why they're being timed out")
-@app_commands.choices(unit=[
-    app_commands.Choice(name="Minutes", value="minutes"),
-    app_commands.Choice(name="Hours", value="hours"),
-    app_commands.Choice(name="Days", value="days"),
-])
-@app_commands.guild_only()
-@require_tier("mod")
-async def timeout_cmd(
-    interaction: discord.Interaction,
-    member: discord.Member,
-    amount: app_commands.Range[int, 1, 40320],
-    unit: app_commands.Choice[str],
-    reason: app_commands.Range[str, 1, 300],
-):
-    await interaction.response.defer(ephemeral=True)
-
-    try:
-        duration = timedelta(**{unit.value: amount})
-    except OverflowError:
-        duration = timedelta(days=9999)
-
-    if duration > timedelta(days=28):
-        return await reject(interaction, "timeout", member, "Discord only allows timeouts up to 28 days.")
-
-    problem = target_problem(interaction, member)
-    if problem:
-        return await reject(interaction, "timeout", member, problem)
-
-    unit_label = unit.value if amount != 1 else unit.value[:-1]
-    await _apply_timeout(interaction, member, duration, reason, "timeout", "TIMEOUT", f"for {amount} {unit_label}")
-
-
-# ================================================================
-# /KICK  (high rank only)
-# ================================================================
-@bot.tree.command(name="kick", description="Kick a member and log a kick card. High rank only.", guild=GUILD)
-@app_commands.describe(member="The member being kicked", reason="Why they're being kicked")
-@app_commands.guild_only()
-@require_tier(KICK_MIN_TIER)
-async def kick_cmd(interaction: discord.Interaction, member: discord.Member, reason: app_commands.Range[str, 1, 300]):
-    await interaction.response.defer(ephemeral=True)
-
-    problem = target_problem(interaction, member)
-    if problem:
-        return await reject(interaction, "kick", member, problem)
-
-    # DM first: after the kick the bot no longer shares a server with them.
-    dm = await dm_member(member, interaction.guild, f"You were kicked from {interaction.guild.name}", reason, 0xFF7043)
-
-    try:
-        await member.kick(reason=audit_reason(reason, "kicked", interaction.user))
-    except discord.Forbidden:
-        await undo_dm(dm)
-        return await reject(interaction, "kick", member, "I do not have permission to kick that member.")
-    except discord.HTTPException as e:
-        await undo_dm(dm)
-        print(f"❌ /kick HTTPException for {member}: {e}")
-        return await interaction.followup.send(f"⚠️ {bold('Failed to kick:')} {e}", ephemeral=True)
-
-    await issue_punishment(interaction, member, "KICK", reason)
-
-
-# ================================================================
-# /BAN  (high rank only; also works on someone who already left the server)
-# ================================================================
-@bot.tree.command(name="ban", description="Ban a member and log a ban card. High rank only.", guild=GUILD)
-@app_commands.describe(member="Who to ban (can be someone who already left: paste their user ID)", reason="Why they're being banned")
-@app_commands.guild_only()
-@require_tier(BAN_MIN_TIER)
-async def ban_cmd(interaction: discord.Interaction, member: discord.User, reason: app_commands.Range[str, 1, 300]):
-    await interaction.response.defer(ephemeral=True)
-
-    guild = interaction.guild
-    in_server = guild.get_member(member.id)
-
-    if in_server is not None:
-        problem = target_problem(interaction, in_server)
-    elif member.id == interaction.user.id:
-        problem = "You can't punish yourself."
-    elif bot.user and member.id == bot.user.id:
-        problem = "I can't punish myself."
-    elif member.id == guild.owner_id:
-        problem = "You can't punish the server owner."
+    if voice_channel is not None:
+        where = f"Waiting in {voice_channel.mention} — *join them to help.*"
     else:
-        problem = None
+        where = "Sent from the support panel — *they are **not** in a voice channel, contact them directly.*"
 
-    if problem:
-        return await reject(interaction, "ban", member, problem)
+    embed = discord.Embed(
+        title=f"{emoji} Help Request".strip(),
+        description=f"## {member.mention} needs a moderator\n{where}",
+        color=PURPLE,
+    )
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.add_field(name="Member", value=member.mention, inline=True)
+    embed.add_field(name="ID", value=f"`{member.id}`", inline=True)
+    embed.add_field(name="Account Created", value=discord.utils.format_dt(member.created_at, "R"), inline=True)
+    embed.add_field(name="Voice Channel", value=voice_channel.mention if voice_channel else "`Not in a voice channel`", inline=True)
+    embed.add_field(name="Waiting Since", value=discord.utils.format_dt(discord.utils.utcnow(), "R"), inline=True)
+    embed.add_field(name="Status", value="🟡 `Waiting`", inline=True)
+    if issue or config.get("send_member_panel", True):
+        embed.add_field(
+            name="Issue",
+            value=f">>> {issue}"[:1024] if issue else "*The member hasn't described the issue yet.*",
+            inline=False,
+        )
+    embed.set_footer(
+        text="ELITE LEADERS COMMUNITY • Press Claim first, then Resolve when it's handled",
+        icon_url=member.guild.icon.url if member.guild.icon else None,
+    )
+    embed.timestamp = discord.utils.utcnow()
 
-    dm = await dm_member(member, guild, f"You were banned from {guild.name}", reason, 0xE53935) if in_server else None
-
+    alert_message = None
     try:
-        await guild.ban(member, reason=audit_reason(reason, "banned", interaction.user))
-    except discord.Forbidden:
-        await undo_dm(dm)
-        return await reject(interaction, "ban", member, "I do not have permission to ban that member.")
-    except discord.HTTPException as e:
-        await undo_dm(dm)
-        print(f"❌ /ban HTTPException for {member}: {e}")
-        return await interaction.followup.send(f"⚠️ {bold('Failed to ban:')} {e}", ephemeral=True)
+        alert_message = await send_with_retry(
+            help_channel,
+            content="@everyone A member needs a moderator",
+            embed=embed,
+            view=help_view(member.id),
+            allowed_mentions=discord.AllowedMentions(everyone=True),
+        )
+        print(f"✅ Help alert sent for {member}")
+    except Exception as e:
+        print(f"❌ Failed to send help alert: {e}")
 
-    await issue_punishment(interaction, member, "BAN", reason)
-
-
-# ================================================================
-# /BLACKLIST  and  /UNBLACKLIST  (high rank only)
-# ================================================================
-@bot.tree.command(
-    name="blacklist",
-    description="Blacklist a member: remove ALL their roles and give them the blacklist role. High rank only.",
-    guild=GUILD,
-)
-@app_commands.describe(member="The member being blacklisted", reason="Why they're being blacklisted")
-@app_commands.guild_only()
-@require_tier(BLACKLIST_MIN_TIER)
-async def blacklist_cmd(interaction: discord.Interaction, member: discord.Member, reason: app_commands.Range[str, 1, 300]):
-    await interaction.response.defer(ephemeral=True)
-    guild = interaction.guild
-
-    problem = target_problem(interaction, member)
-    if problem:
-        return await reject(interaction, "blacklist", member, problem)
-
-    role = guild.get_role(BLACKLIST_ROLE_ID)
-    if role is None:
-        return await reject(interaction, "blacklist", member, "The blacklist role was not found — check BLACKLIST_ROLE_ID.")
-    if guild.me and role >= guild.me.top_role:
-        return await reject(interaction, "blacklist", member, "The blacklist role is above mine — move my role higher.")
-
-    async with blacklist_lock:
-        if member.id in blacklist_records:
-            return await reject(interaction, "blacklist", member, "That member is already blacklisted.")
-
-        removed = [r.id for r in removable_roles(member)]
-        try:
-            await lock_blacklist_roles(member, audit_reason(reason, "blacklisted", interaction.user))
-        except discord.Forbidden:
-            return await reject(interaction, "blacklist", member,
-                                "I do not have permission to change that member's roles (check Manage Roles and my role position).")
-        except discord.HTTPException as e:
-            print(f"❌ /blacklist HTTPException for {member}: {e}")
-            return await interaction.followup.send(f"⚠️ {bold('Failed to blacklist:')} {e}", ephemeral=True)
-
-        blacklist_records[member.id] = {
-            "roles": removed,
-            "reason": reason,
-            "by": interaction.user.id,
-            "by_tag": str(interaction.user),
-            "date_text": discord.utils.utcnow().strftime("%d/%m/%Y"),
-        }
-        save_db()
-        print(f"💀 {member} blacklisted by {interaction.user} ({len(removed)} roles removed)")
-
-    await dm_member(
-        member, guild, f"You were blacklisted in {guild.name}", reason, 0x2B2D31,
-        "All your roles were removed. Only the high rank can lift this.",
-    )
-
-    case_no = await issue_punishment(
-        interaction, member, "BLACKLIST", reason,
-        record_extra={"removed_roles": removed},
-        confirm_note=f"{bold('Roles removed:')} **{len(removed)}**.",
-    )
-    if case_no is not None and member.id in blacklist_records:
-        blacklist_records[member.id]["case"] = case_no
-        save_db()
-
-
-@bot.tree.command(
-    name="unblacklist",
-    description="Lift a blacklist and give the member their old roles back. High rank only.",
-    guild=GUILD,
-)
-@app_commands.describe(member="The member to un-blacklist (also works if they left: paste their user ID)", reason="Why the blacklist is lifted")
-@app_commands.guild_only()
-@require_tier(BLACKLIST_MIN_TIER)
-async def unblacklist_cmd(interaction: discord.Interaction, member: discord.User, reason: app_commands.Range[str, 1, 300]):
-    await interaction.response.defer(ephemeral=True)
-    guild = interaction.guild
-
-    async with blacklist_lock:
-        entry = blacklist_records.get(member.id)
-        if entry is None:
-            return await interaction.followup.send(f"ℹ️ {member.mention} is not blacklisted.", ephemeral=True)
-
-        target = guild.get_member(member.id)
-
-        # The record goes FIRST, otherwise the blacklist lock would strip the restored roles again.
-        del blacklist_records[member.id]
-        save_db()
-
-        restored = 0
-        if target is not None:
-            me_top = guild.me.top_role if guild.me else None
-            old_roles = [guild.get_role(i) for i in entry.get("roles", [])]
-            restore = [
-                r for r in old_roles
-                if r and not r.is_default() and not r.managed and (me_top is None or r < me_top)
-            ]
+    entry = help_panels.get(member.id)
+    if entry is None:
+        # The request was closed (member left / cancelled) while the alert was being sent.
+        if alert_message is not None:
             try:
-                await target.edit(roles=kept_roles(target) + restore,
-                                  reason=audit_reason(reason, "unblacklisted", interaction.user))
-                restored = len(restore)
-            except discord.HTTPException as e:
-                blacklist_records[member.id] = entry   # put it back: nothing changed
-                save_db()
-                print(f"❌ /unblacklist failed for {member}: {e}")
-                return await interaction.followup.send(
-                    f"⚠️ {bold('Failed to give the roles back:')} {e}", ephemeral=True)
+                left = alert_message.embeds[0].copy()
+                set_field(left, "Status", ALERT_STATUS["Member left"], inline=True)
+                left.set_footer(text="Member left", icon_url=left.footer.icon_url)
+                await alert_message.edit(embed=left, view=help_view(member.id, disabled=True))
+            except discord.HTTPException:
+                pass
+        return
+    entry["alert"] = alert_message
 
-            await update_warning_roles(guild, target, min(active_warning_count(target.id), MAX_WARNINGS - 1))
+    if entry.get("show") and entry.get("queued"):
+        await refresh_shared_panel(member.guild)
 
-    print(f"💀 {member} un-blacklisted by {interaction.user} ({restored} roles restored)")
-
-    if target is not None:
-        await dm_member(
-            target, guild, f"Your blacklist in {guild.name} was lifted", reason, 0x57F287,
-            "Your roles were given back.",
-        )
-
-    embed = discord.Embed(
-        title=bold("Blacklist removed"),
-        description=f"{member.mention} was removed from the blacklist by {interaction.user.mention}.",
-        color=discord.Color.green(),
-        timestamp=discord.utils.utcnow(),
-    )
-    embed.add_field(name=bold("Reason"), value=short(reason, 300), inline=False)
-    if target is not None:
-        embed.add_field(name=bold("Roles restored"), value=str(restored), inline=True)
-    embed.set_thumbnail(url=member.display_avatar.url)
-    try:
-        await get_log_channel(interaction).send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
-    except discord.HTTPException as e:
-        print(f"⚠️ Couldn't post the blacklist-removed notice: {e}")
-
-    note = f"{restored} roles restored." if target is not None else "They are not in the server, so no roles were given."
-    await interaction.followup.send(f"🟢 {member.mention} is no longer blacklisted. {note}", ephemeral=True)
+    # The short self-deleting ping when the member joins the help voice channel (kept as before).
+    if PING_ON_JOIN and ping and entry.get("show"):
+        ping_channel = member.guild.get_channel(MEMBER_HELP_PANEL_CHANNEL_ID)
+        if isinstance(ping_channel, discord.TextChannel):
+            task = asyncio.create_task(ping_member(ping_channel, member, JOIN_PING_TEXT))
+            _bg_tasks.add(task)
+            task.add_done_callback(_bg_tasks.discard)
 
 
-@bot.tree.command(name="blacklisted", description="Show everyone who is currently blacklisted.", guild=GUILD)
-@app_commands.guild_only()
-@require_tier("mod")
-async def blacklisted_cmd(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
+@bot.event
+async def on_voice_state_update(
+    member: discord.Member,
+    before: discord.VoiceState,
+    after: discord.VoiceState,
+):
+    """
+    - Waiting for Move VC: ⏳ on the nickname + verification alert.
+    - Help VC: ⏳ on the nickname + mod alert (the member joins the queue when they send their issue).
+    - Report VCs: 📛 on the nickname + a private report room.
+    - Leaving restores the nickname. Requests that were sent from the panel (member not in voice)
+      are NOT closed by voice events.
+    """
+    if member.guild.id != GUILD_ID or member.bot:
+        return
 
-    if not blacklist_records:
-        return await interaction.followup.send("ℹ️ Nobody is blacklisted.", ephemeral=True)
+    before_id = before.channel.id if before.channel else None
+    after_id = after.channel.id if after.channel else None
 
-    rows = sorted(blacklist_records.items(), key=lambda kv: kv[1].get("case", 0), reverse=True)
-    lines = [
-        f"<@{uid}> • {e.get('date_text', '?')} • by <@{e.get('by', 0)}>\n{short(e.get('reason', ''), 120)}"
-        for uid, e in rows[:15]
-    ]
-    embed = discord.Embed(
-        title=bold("Blacklisted members"),
-        description="\n\n".join(lines)[:4000],
-        color=discord.Color.dark_grey(),
-    )
-    embed.set_footer(text=f"Showing {min(len(rows), 15)} of {len(rows)}")
-    await interaction.followup.send(embed=embed, ephemeral=True)
+    if before_id == after_id:
+        return
 
+    _nick_failed.discard(member.id)
 
-# ================================================================
-# /WARNINGS and /HISTORY  (read-only)
-# ================================================================
-@bot.tree.command(name="warnings", description="Show a member's active warnings and when they clear.", guild=GUILD)
-@app_commands.describe(member="The member to check")
-@app_commands.guild_only()
-@require_tier("mod")
-async def warnings_cmd(interaction: discord.Interaction, member: discord.User):
-    await interaction.response.defer(ephemeral=True)
+    entry0 = help_panels.get(member.id)
+    if entry0 is not None and entry0.get("origin", "vc") == "vc" and before_id in HELP_VC_CONFIG:
+        if after_id is None:
+            if member.id not in _leave_tasks:
+                _leave_tasks[member.id] = asyncio.create_task(close_after_grace(member.id))
+                entry0["status_before"] = entry0["status"]
+                await set_panel_status(member.id, "🟠 Disconnected — waiting for them to reconnect")
+        elif after_id != before_id:
+            await close_help_request(
+                member.id,
+                "🟢 Resolved — a moderator moved you",
+                PURPLE,
+                alert_footer="Member moved",
+                lock_alert=False,
+            )
 
-    active = active_warning_records(member.id)
-    if not active:
-        return await interaction.followup.send(f"ℹ️ {member.mention} has no active warnings.", ephemeral=True)
+    nick_task = None
+    if (
+        before_id in ALERT_VC_IDS
+        or after_id in ALERT_VC_IDS
+        or _is_report_room(before.channel)
+        or _is_report_room(after.channel)
+    ):
+        nick_task = asyncio.create_task(set_report_vc_alert(member))
 
-    lines = [
-        f"**ELT-{case_no:04d}** • {rec['date_text']} • by <@{rec['punisher_id']}>\n{short(rec['reason'], 150)}"
-        for case_no, rec in active
-    ]
-    embed = discord.Embed(
-        title=bold(f"Active warnings — {card_name(member)}"),
-        description="\n\n".join(lines)[:4000],
-        color=discord.Color.orange(),
-    )
-
-    times = [t for t in (_parse_warning_time(rec) for _, rec in active) if t]
-    if times:
-        clears = max(times) + timedelta(days=WARNING_EXPIRE_DAYS)
-        embed.add_field(name=bold("Auto-clear"), value=discord.utils.format_dt(clears, "R"), inline=False)
-    embed.set_footer(text=f"{len(active)}/{MAX_WARNINGS} active warnings")
-    embed.set_thumbnail(url=member.display_avatar.url)
-
-    await interaction.followup.send(embed=embed, ephemeral=True)
-
-
-@bot.tree.command(name="history", description="Show a member's last punishment cases.", guild=GUILD)
-@app_commands.describe(member="The member to check (works for people who left: paste their user ID)")
-@app_commands.guild_only()
-@require_tier("mod")
-async def history_cmd(interaction: discord.Interaction, member: discord.User):
-    await interaction.response.defer(ephemeral=True)
-
-    cases = sorted(
-        ((c, r) for c, r in punishment_records.items() if r.get("user_id") == member.id),
-        key=lambda item: item[0],
-        reverse=True,
-    )
-    if not cases:
-        return await interaction.followup.send(f"ℹ️ No cases found for {member.mention}.", ephemeral=True)
-
-    lines = [
-        f"`ELT-{c:04d}` **{r.get('display_type', r['type']).title()}** • {r['date_text']}\n{short(r['reason'], 100)}"
-        for c, r in cases[:15]
-    ]
-    embed = discord.Embed(
-        title=bold(f"Case history — {card_name(member)}"),
-        description="\n\n".join(lines)[:4000],
-        color=discord.Color.blurple(),
-    )
-    embed.set_footer(text=f"Showing {min(len(cases), 15)} of {len(cases)} cases")
-    embed.set_thumbnail(url=member.display_avatar.url)
-
-    await interaction.followup.send(embed=embed, ephemeral=True)
-
-
-# ================================================================
-# APP COMMAND ERROR
-# ================================================================
-@bot.tree.error
-async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    command_name = interaction.command.name if interaction.command else "unknown"
-
-    # A "you are not allowed" rejection is normal: one short line, no traceback.
-    if isinstance(error, (NotAllowed, app_commands.MissingPermissions)):
-        print(f"🚫 /{command_name}: {interaction.user} not allowed")
-    else:
-        print("\n" + "=" * 70)
-        print(f"❌ APP COMMAND ERROR  /{command_name}  by {interaction.user} ({interaction.user.id})")
-        print(f"Error: {type(error).__name__}: {error}")
-        original = getattr(error, "original", None)
-        if original is not None:
-            print(f"Original: {type(original).__name__}: {original}")
-        traceback.print_exception(type(error), error, error.__traceback__)
-        print("=" * 70 + "\n")
-
-    if isinstance(error, app_commands.MissingPermissions):
-        msg = f"⚠️ {bold('You do not have permission to do that.')}"
-    elif isinstance(error, NotAllowed):
-        msg = f"⚠️ {bold(str(error))}"
-    elif isinstance(error, app_commands.TransformerError):
-        msg = f"⚠️ {bold('I could not find that member in the server — they may have left.')}"
-    elif isinstance(error, app_commands.CheckFailure):
-        msg = f"⚠️ {bold('You are not allowed to use this command.')}"
-    else:
-        msg = f"⚠️ {bold('Something went wrong running that command.')}"
+    if before.channel is not None and _is_report_room(before.channel):
+        asyncio.create_task(delete_if_empty_report_room(before.channel))
 
     try:
-        if interaction.response.is_done():
-            await interaction.followup.send(msg, ephemeral=True)
-        else:
-            await interaction.response.send_message(msg, ephemeral=True)
-    except discord.HTTPException:
-        pass
+        if after_id in REPORT_VC_IDS:
+            await create_report_room(member)
+
+        elif after_id == WAITING_VC_ID:
+            if isinstance(after.channel, (discord.VoiceChannel, discord.StageChannel)):
+                await send_verification_alert(member, after.channel)
+
+        elif after_id in HELP_VC_CONFIG:
+            pending = _leave_tasks.pop(member.id, None)
+            if pending is not None:
+                pending.cancel()
+                entry = help_panels.get(member.id)
+                if entry is not None:
+                    await set_panel_status(member.id, entry.pop("status_before", "🟡 Waiting for a moderator"))
+            if isinstance(after.channel, (discord.VoiceChannel, discord.StageChannel)):
+                await send_help_alert(
+                    member,
+                    after.channel,
+                    HELP_VC_CONFIG[after_id],
+                )
+    finally:
+        if nick_task is not None:
+            await nick_task
 
 
-# ================================================================
-# START BOT
-# ================================================================
 if not TOKEN:
     raise SystemExit("DISCORD_TOKEN is not set. Add it in Railway's Variables tab, then redeploy.")
 
