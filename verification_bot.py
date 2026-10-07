@@ -24,10 +24,15 @@ v2 (support panel in #describe-issue):
     - A member is added to "Current queue" when they SEND their issue.
     - Members not in a voice channel get a short self-deleting ping when a moderator claims/resolves.
 
+    - Verification card: "Invited by" is now read from the -INVITE log channel (InviteLogger),
+      so it shows the real inviter instead of the bot that made the invite (e.g. DISBOARD).
+
 Requirements:
     pip install "discord.py>=2.4"
 
 Before running:
+    - Enable MESSAGE CONTENT INTENT in the Developer Portal (Bot > Privileged Gateway Intents),
+      and let the bot View Channel + Read Message History in the -INVITE channel.
     - Enable SERVER MEMBERS INTENT for your bot in the Discord Developer Portal.
     - Give the bot "Manage Nicknames" and put the bot's role ABOVE the roles it must rename.
     - The bot must be in the server that owns the custom emojis.
@@ -58,6 +63,10 @@ WAITING_VC_ID = 1513904254535073883              # the "Waiting for Move" voice 
 HELP_ALERT_CHANNEL_ID = 1551163762084683866  # channel where the mod alert gets posted
 MEMBER_HELP_PANEL_CHANNEL_ID = 1553786062579699722  # #describe-issue (the shared panel lives here)
 ISSUE_REPORTS_CHANNEL_ID = 1553196616146493460  # channel where "Describe Issue" submissions get posted
+# The -INVITE log channel (InviteLogger posts "X just joined. They were invited by Y ..." there).
+# Paste its ID for 100% reliability. If left as None the bot finds a text channel whose name ends in "invite".
+INVITE_LOG_CHANNEL_ID = None
+INVITE_LOG_SCAN_LIMIT = 300                      # how many recent log messages to search
 
 # Per-VC settings for the "waiting for help" flow:
 #   emoji: shown in the mod alert title | send_member_panel: list members on the shared panel queue
@@ -92,6 +101,7 @@ _STRIPPABLE_EMOJIS = sorted(ALERT_EMOJIS | LEGACY_ALERT_EMOJIS, key=len, reverse
 UNVERIFIED_ROLE_ID = 1513904174079934657
 VERIFIED_ROLE_ID = 1513904156350353511
 EXTRA_ROLES_ON_VERIFY = [1513904151309058159]  # MEMBER role
+MOD_ROLE_ID = 1513904125086011402               # moderators: always see / enter / talk in report rooms
 
 # ---------------- Button emojis (the ONLY emojis left - cards and panels are text only) ----------------
 VERIFY_EMOJI = discord.PartialEmoji(name="positivo", id=1553555472811040788)
@@ -130,6 +140,7 @@ intents = discord.Intents.default()
 intents.members = True
 intents.voice_states = True
 intents.invites = True
+intents.message_content = True   # needed to READ the InviteLogger embeds (enable it in the Developer Portal too)
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -247,6 +258,48 @@ def _alert_emoji_for(member: discord.Member) -> str | None:
     return ALERT_VC_EMOJIS.get(channel.id)
 
 
+_ACCESS = dict(view_channel=True, connect=True, speak=True, send_messages=True, read_message_history=True)
+
+
+def _report_room_overwrites(guild: discord.Guild, base: dict, member: discord.Member | None = None) -> dict:
+    """The category's overwrites + guaranteed access for the mod role (and the member who is reporting).
+    A role 'allow' beats the category's 'deny View Channel' on MEMBER, so mods are never locked out."""
+    overwrites = dict(base)
+    mod_role = guild.get_role(MOD_ROLE_ID)
+    if mod_role is not None:
+        ow = overwrites.get(mod_role, discord.PermissionOverwrite())
+        ow.update(**_ACCESS)
+        overwrites[mod_role] = ow
+    else:
+        print("⚠️ Can't find the mod role — check MOD_ROLE_ID")
+    if member is not None:
+        ow = overwrites.get(member, discord.PermissionOverwrite())
+        ow.update(**_ACCESS)
+        overwrites[member] = ow
+    return overwrites
+
+
+async def ensure_report_room_access(room: discord.abc.GuildChannel, member: discord.Member | None = None):
+    """Adds the mod role (and the reporting member) to an EXISTING report room."""
+    guild = room.guild
+    targets = []
+    mod_role = guild.get_role(MOD_ROLE_ID)
+    if mod_role is not None:
+        targets.append(mod_role)
+    if member is not None:
+        targets.append(member)
+    for target in targets:
+        ow = room.overwrites_for(target)
+        ow.update(**_ACCESS)
+        try:
+            await room.set_permissions(target, overwrite=ow, reason="Mods/reporter must be able to use the report room")
+        except discord.Forbidden:
+            print("⚠️ Can't edit report room permissions — give the bot 'Manage Channels' and 'Manage Roles'")
+            return
+        except discord.HTTPException as e:
+            print(f"⚠️ Couldn't update report room permissions: {e}")
+
+
 async def create_report_room(member: discord.Member):
     guild = member.guild
     lock = _report_locks.setdefault(member.id, asyncio.Lock())
@@ -279,7 +332,7 @@ async def create_report_room(member: discord.Member):
                 room = await guild.create_voice_channel(
                     REPORT_CHANNEL_NAME,
                     category=category,
-                    overwrites=category.overwrites,
+                    overwrites=_report_room_overwrites(guild, category.overwrites, member),
                     reason=f"Report room for {member}",
                 )
             except discord.Forbidden:
@@ -292,6 +345,9 @@ async def create_report_room(member: discord.Member):
             report_room_ids.add(room.id)
             member_report_rooms[member.id] = room.id
             _report_last_created[member.id] = time.monotonic()
+
+        if not created_new:
+            await ensure_report_room_access(room, member)
 
         try:
             await member.move_to(room, reason="Moved into their report room")
@@ -1326,6 +1382,7 @@ async def on_ready():
         for vc in list(report_category.voice_channels):
             if not _is_report_room(vc):
                 continue
+            await ensure_report_room_access(vc)
             if vc.members:
                 for room_member in vc.members:
                     if not room_member.bot:
@@ -1458,6 +1515,56 @@ async def find_latest_verification(channel: discord.TextChannel, member_id: int)
     return None
 
 
+def _find_invite_log_channel(guild: discord.Guild) -> discord.TextChannel | None:
+    if INVITE_LOG_CHANNEL_ID:
+        ch = guild.get_channel(INVITE_LOG_CHANNEL_ID)
+        return ch if isinstance(ch, discord.TextChannel) else None
+    for ch in guild.text_channels:
+        if ch.name.lower().rstrip().endswith("invite"):
+            return ch
+    return None
+
+
+def _embed_text(embed: discord.Embed) -> str:
+    parts = [embed.title or "", embed.description or ""]
+    parts += [f"{f.name} {f.value}" for f in embed.fields]
+    return "\n".join(p for p in parts if p)
+
+
+async def lookup_inviter_from_log(guild: discord.Guild, member: discord.Member) -> str | None:
+    """Reads the InviteLogger posts in the -INVITE channel and returns who invited `member`
+    (newest matching post wins). Returns None if nothing is found."""
+    channel = _find_invite_log_channel(guild)
+    if channel is None:
+        print("⚠️ Couldn't find the -INVITE log channel — set INVITE_LOG_CHANNEL_ID")
+        return None
+    uid = str(member.id)
+    try:
+        async for msg in channel.history(limit=INVITE_LOG_SCAN_LIMIT):
+            if not msg.embeds:
+                continue
+            for embed in msg.embeds:
+                text = _embed_text(embed)
+                idx = text.lower().find("invited by")
+                if idx == -1 or uid not in text[:idx]:
+                    continue  # not this member's join post (or the id is only the inviter's)
+                rest = text[idx + len("invited by"):].strip()
+                rest = re.split(r"\s+who\b|\n|[!]+\s*$", rest, maxsplit=1)[0].strip(" .!*_`")
+                if not rest:
+                    continue
+                mention = re.search(r"<@!?(\d+)>", rest)
+                if mention:
+                    inviter_member = guild.get_member(int(mention.group(1)))
+                    name = f" (`{inviter_member.name}`)" if inviter_member else ""
+                    return f"<@{mention.group(1)}>{name}"
+                return f"**{rest}**"
+    except discord.Forbidden:
+        print("⚠️ Can't read the -INVITE channel — give the bot View Channel + Read Message History there")
+    except discord.HTTPException as e:
+        print(f"⚠️ Couldn't read the -INVITE channel: {e}")
+    return None
+
+
 async def send_verification_alert(member: discord.Member, voice_channel: discord.VoiceChannel):
     lock = _verify_locks.setdefault(member.id, asyncio.Lock())
     async with lock:
@@ -1546,11 +1653,14 @@ async def _send_verification_alert(member: discord.Member, voice_channel: discor
 
     print(f"📤 Sending verification message for {member}")
 
-    inviter = member_inviters.get(member.id)
-    if inviter:
-        invited_by_text = f"{inviter.mention} (`{inviter.name}`)"
-    else:
-        invited_by_text = "`Unknown` — vanity URL or unknown invite"
+    # 1) the -INVITE log channel (most accurate)  2) the bot's own invite tracking  3) unknown
+    invited_by_text = await lookup_inviter_from_log(member.guild, member)
+    if invited_by_text is None:
+        inviter = member_inviters.get(member.id)
+        if inviter:
+            invited_by_text = f"{inviter.mention} (`{inviter.name}`)"
+        else:
+            invited_by_text = "`Unknown` — vanity URL or unknown invite"
 
     warning_text = ""
     if NEW_ACCOUNT_WARNING_DAYS:
