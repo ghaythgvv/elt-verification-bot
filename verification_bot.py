@@ -1,31 +1,22 @@
 """
-Discord Verification Bot  (v2.1)
+Discord Verification Bot  (v2.2)
 =======================================
-What's new in v2.1 (verification alerts in #verify):
-    - New, cleaner verification card (member, ID, account age, joined, invited by, voice channel, status).
-    - Reject now asks the moderator for a REASON (pop-up). The reason is written on the card and the
-      member gets a DM with it (DM_ON_REJECT).
+What's new in v2.2 (visual refresh):
+    - All colored circles (🟡 🟢 🔴 🟣 ⚪ 🟠 🔵) are gone. Everything now uses your purple custom emojis.
+    - Cleaner verification card with an emoji on every field.
+    - Buttons (Verify / Reject / Claim / Resolve / Seen / Describe Issue / Cancel) have custom emojis.
+    - Footer texts are unchanged on purpose (the bot's logic compares against them).
+
+v2.1 (verification alerts in #verify):
+    - Reject asks the moderator for a REASON (pop-up); the member gets a DM with it (DM_ON_REJECT).
     - Rejoin spam control: while a request is open, rejoining only updates a counter on the same card.
-      A short "still waiting" reminder ping is sent at most once every 5 minutes (REJOIN_PING_COOLDOWN).
     - A rejected member who comes back gets a new card that shows the previous rejection reason.
     - If the member leaves the server while their request is open, the card is closed ("Member left").
-    - Inviter is always readable (mention + username), even if the inviter left the server.
 
-What's new in v2 (support panel in #describe-issue):
-    - ANYONE can press "Describe Issue" in #describe-issue - no voice channel needed.
-    - A member is added to "Current queue" when they SEND their issue (not when they join a voice channel).
-    - Sending an issue from the panel opens the mod alert (@everyone, Claim / Resolve buttons) by itself.
-    - Members who are not in a voice channel get a short self-deleting ping in #describe-issue when a
-      moderator claims or resolves their request.
-    - Joining the "Waiting for Help" voice channel still works as before (mod alert + the short ping in
-      #describe-issue), but the member only appears in the queue after they press Describe Issue.
-
-Everything else works exactly as before:
-1) "Waiting for Move" voice channel -> nickname gets ⏳, verification embed with Verify / Reject.
-2) "Waiting for Help" voice channel -> nickname gets ⏳, mod alert with Claim / Resolve.
-3) "REPORT" voice channels -> nickname gets 📛, a private report room is created.
-4) Verify gives the Verified + Member roles and removes Unverified.
-All buttons are PERSISTENT (they keep working after restarts / redeploys).
+v2 (support panel in #describe-issue):
+    - ANYONE can press "Describe Issue" - no voice channel needed.
+    - A member is added to "Current queue" when they SEND their issue.
+    - Members not in a voice channel get a short self-deleting ping when a moderator claims/resolves.
 
 Requirements:
     pip install "discord.py>=2.4"
@@ -33,8 +24,7 @@ Requirements:
 Before running:
     - Enable SERVER MEMBERS INTENT for your bot in the Discord Developer Portal.
     - Give the bot "Manage Nicknames" and put the bot's role ABOVE the roles it must rename.
-    - In #describe-issue the bot needs View Channel, Send Messages, Embed Links, Mention Everyone,
-      Read Message History and Manage Messages, and members must be able to see the channel.
+    - The bot must be in the server that owns the custom emojis.
     - Set DISCORD_TOKEN as an environment variable (Railway > Variables).
 """
 
@@ -97,9 +87,48 @@ UNVERIFIED_ROLE_ID = 1513904174079934657
 VERIFIED_ROLE_ID = 1513904156350353511
 EXTRA_ROLES_ON_VERIFY = [1513904151309058159]  # MEMBER role
 
+# ---------------- Custom emojis (from your server) ----------------
+E_HOURGLASS = "<:hourglass:1553596332025974864>"
+E_CHECK     = "<:positivo:1553555472811040788>"
+E_X         = "<:purple_x:1554671367142645770>"
+E_WARN      = "<:purple_warning:1554671365490212945>"
+E_SHIELD_OK = "<:shield_check:1553472890601734325>"
+E_SHIELD_X  = "<:shield_x:1553472897757224980>"
+E_PEOPLE    = "<:people:1553472892111560754>"
+E_SMILEY    = "<:smile:1553472899589873784>"
+E_KEY       = "<:key:1553558393023897610>"
+E_LINK      = "<:link:1554675609525821531>"
+E_EXIT      = "<:leave:1553472901301280870>"
+E_SPEAKER   = "<:speaker:1553558390397993070>"
+E_PENCIL    = "<:pencil:1553472888906977300>"
+E_CROWN     = "<:crown:1554186011809021953>"
+
+VERIFY_EMOJI = discord.PartialEmoji(name="positivo", id=1553555472811040788)
+REJECT_EMOJI = discord.PartialEmoji(name="purple_x", id=1554671367142645770)
+CLAIM_EMOJI = discord.PartialEmoji(name="crown", id=1554186011809021953)
+RESOLVE_EMOJI = discord.PartialEmoji(name="shield_check", id=1553472890601734325)
+SEEN_EMOJI = discord.PartialEmoji(name="positivo", id=1553555472811040788)
+DESCRIBE_EMOJI = discord.PartialEmoji(name="pencil", id=1553472888906977300)
+
+STATUS_WAITING  = f"{E_HOURGLASS} **Waiting**"
+STATUS_CLAIMED  = f"{E_CROWN} **Claimed**"
+STATUS_VERIFIED = f"{E_SHIELD_OK} **Verified**"
+STATUS_REJECTED = f"{E_SHIELD_X} **Rejected**"
+STATUS_LEFT     = f"{E_EXIT} **Member left**"
+
+# Panel (queue) statuses
+PS_WAITING = f"{E_HOURGLASS} Waiting for a moderator"
+PS_SENT = f"{E_HOURGLASS} Message sent — waiting for a moderator"
+PS_DISCONNECTED = f"{E_EXIT} Disconnected — waiting for them to reconnect"
+
+
+def ps_claimed(mention: str) -> str:
+    return f"{E_CROWN} {mention} is handling your request"
+
+
 # New-account warning (0 = off)
 NEW_ACCOUNT_WARNING_DAYS = 7
-WARN_EMOJI = "<:warn_purple:1554671365490212945>"
+WARN_EMOJI = E_WARN
 
 # Anti-spam
 VERIFY_REALERT_COOLDOWN = 5 * 60   # after a request was handled, a new card is only sent after this
@@ -151,10 +180,10 @@ _startup_sync_done = False
 
 ALERT_DONE_FOOTERS = ("Resolved", "Member left", "Cancelled", "Resolved ✅", "Resolved ☑️", "Member left ❌", "Cancelled ⚪")
 ALERT_STATUS = {
-    "Resolved": "🟢 `Resolved`",
-    "Member left": "🔴 `Member left`",
-    "Cancelled": "⚪ `Cancelled`",
-    "Member moved": "🔵 `Member moved`",
+    "Resolved": f"{E_SHIELD_OK} **Resolved**",
+    "Member left": f"{E_EXIT} **Member left**",
+    "Cancelled": f"{E_X} **Cancelled**",
+    "Member moved": f"{E_PEOPLE} **Member moved**",
 }
 
 # Short self-deleting @mention in #describe-issue (edits to the panel never notify anyone).
@@ -431,11 +460,14 @@ async def dm_rejected_member(guild: discord.Guild, member_id: int, reason: str) 
     if member is None:
         return False
     embed = discord.Embed(
-        title="Your verification was not accepted",
-        description=f"A moderator reviewed your request in **{guild.name}** and could not verify you right now.",
+        title=f"{E_SHIELD_X} Verification not accepted",
+        description=(
+            f"A moderator reviewed your request in **{guild.name}** and could not verify you right now.\n"
+            f"-# You are welcome to join the voice channel again once the issue is fixed."
+        ),
         color=PURPLE,
     )
-    embed.add_field(name="Reason", value=f">>> {reason}"[:1024], inline=False)
+    embed.add_field(name=f"{E_PENCIL} Reason", value=f">>> {reason}"[:1024], inline=False)
     embed.set_footer(text=guild.name, icon_url=guild.icon.url if guild.icon else None)
     embed.timestamp = discord.utils.utcnow()
     try:
@@ -468,10 +500,10 @@ class RejectReasonModal(discord.ui.Modal, title="Reject Member"):
         reason = self.reason.value.strip()
         embed = message.embeds[0].copy()
         embed.color = PURPLE
-        set_field(embed, "Status", "🔴 `Rejected`", inline=True)
+        set_field(embed, "Status", STATUS_REJECTED, inline=True)
         set_field(
             embed, "Rejected by",
-            f"❌ {interaction.user.mention} • {discord.utils.format_dt(discord.utils.utcnow(), 'R')}",
+            f"{E_X} {interaction.user.mention} • {discord.utils.format_dt(discord.utils.utcnow(), 'R')}",
             inline=False,
         )
         set_field(embed, "Reason", f">>> {reason}"[:1024], inline=False)
@@ -500,12 +532,13 @@ class VerifyButton(
 ):
     def __init__(self, action: str, member_id: int, disabled: bool = False):
         if action == "accept":
-            label, style = "☑️ Verify", discord.ButtonStyle.secondary
+            label, style, emoji = "Verify", discord.ButtonStyle.secondary, VERIFY_EMOJI
         else:
-            label, style = "❌ Reject", discord.ButtonStyle.secondary
+            label, style, emoji = "Reject", discord.ButtonStyle.secondary, REJECT_EMOJI
         super().__init__(
             discord.ui.Button(
                 label=label,
+                emoji=emoji,
                 style=style,
                 custom_id=f"verify_{action}_{member_id}",
                 disabled=disabled,
@@ -566,10 +599,10 @@ class VerifyButton(
             return await interaction.followup.send("Something went wrong while changing roles. Try again.", ephemeral=True)
 
         embed.color = PURPLE
-        set_field(embed, "Status", "🟢 `Verified`", inline=True)
+        set_field(embed, "Status", STATUS_VERIFIED, inline=True)
         set_field(
             embed, "Verified by",
-            f"☑️ {interaction.user.mention} • {discord.utils.format_dt(discord.utils.utcnow(), 'R')}",
+            f"{E_CHECK} {interaction.user.mention} • {discord.utils.format_dt(discord.utils.utcnow(), 'R')}",
             inline=False,
         )
         embed.set_footer(text="Verified ☑️")
@@ -581,7 +614,7 @@ class VerifyButton(
             if welcome_channel:
                 try:
                     await welcome_channel.send(
-                        f"🎉 Welcome {member.mention}, you're verified — glad to have you in the server!"
+                        f"{E_SMILEY} Welcome {member.mention}, you're verified — glad to have you in the server!"
                     )
                 except discord.HTTPException as e:
                     print(f"⚠️ Couldn't send welcome message: {e}")
@@ -640,7 +673,7 @@ async def resolve_alert(interaction: discord.Interaction, member_id: int, note: 
 
     await close_help_request(
         member_id,
-        f"🟢 Resolved by {interaction.user.mention}",
+        f"{E_SHIELD_OK} Resolved by {interaction.user.mention}",
         PURPLE,
         notify=f"your request was resolved by {interaction.user.mention}. Thank you for your patience!",
     )
@@ -674,14 +707,15 @@ class HelpButton(
 ):
     def __init__(self, action: str, member_id: int, disabled: bool = False):
         if action == "claim":
-            label, style = "Claim", discord.ButtonStyle.secondary
+            label, style, emoji = "Claim", discord.ButtonStyle.secondary, CLAIM_EMOJI
         elif action == "resolved":
-            label, style = "Mark as Resolved", discord.ButtonStyle.secondary
+            label, style, emoji = "Mark as Resolved", discord.ButtonStyle.secondary, RESOLVE_EMOJI
         else:
-            label, style = "Resolve", discord.ButtonStyle.secondary
+            label, style, emoji = "Resolve", discord.ButtonStyle.secondary, RESOLVE_EMOJI
         super().__init__(
             discord.ui.Button(
                 label=label,
+                emoji=emoji,
                 style=style,
                 custom_id=f"help_{action}_{member_id}",
                 disabled=disabled,
@@ -715,7 +749,7 @@ class HelpButton(
                     f"Already claimed by {claimed_by}.", ephemeral=True
                 )
             embed.color = PURPLE
-            set_field(embed, "Status", "🟣 `Claimed`", inline=True)
+            set_field(embed, "Status", STATUS_CLAIMED, inline=True)
             set_field(embed, "Claimed by", interaction.user.mention, inline=True)
             await interaction.response.edit_message(embed=embed, view=help_view(self.member_id, claimed=True))
 
@@ -724,7 +758,7 @@ class HelpButton(
                 entry["claimed"] = True
             await set_panel_status(
                 self.member_id,
-                f"🟣 {interaction.user.mention} is handling your request",
+                ps_claimed(interaction.user.mention),
                 PURPLE,
             )
             # A member who is not in voice has no other way to know -> short ping in #describe-issue.
@@ -749,13 +783,18 @@ class IssueReportView(discord.ui.View):
             self.mark_seen.label = "Seen"
             self.mark_seen.disabled = True
 
-    @discord.ui.button(label="Mark as Seen", style=discord.ButtonStyle.secondary, custom_id="issue_report_seen")
+    @discord.ui.button(
+        label="Mark as Seen",
+        emoji=SEEN_EMOJI,
+        style=discord.ButtonStyle.secondary,
+        custom_id="issue_report_seen",
+    )
     async def mark_seen(self, interaction: discord.Interaction, button: discord.ui.Button):
         embed = interaction.message.embeds[0].copy()
         if any(f.name == "Seen by" for f in embed.fields):
             return await interaction.response.send_message("Already marked as seen.", ephemeral=True)
         embed.color = PURPLE
-        set_field(embed, "Status", "🟢 `Seen`", inline=True)
+        set_field(embed, "Status", f"{E_CHECK} **Seen**", inline=True)
         set_field(embed, "Seen by", interaction.user.mention, inline=True)
         set_field(embed, "Seen At", discord.utils.format_dt(discord.utils.utcnow(), "R"), inline=True)
         await interaction.response.edit_message(embed=embed, view=IssueReportView(seen=True))
@@ -777,7 +816,7 @@ def build_shared_embed(guild: discord.Guild) -> discord.Embed:
             lines.append(f"*…and {len(queue) - 15} more*")
         queue_text = "\n".join(lines)
     else:
-        queue_text = "*Nobody is waiting right now.*"
+        queue_text = f"{E_SHIELD_OK} *Nobody is waiting right now.*"
 
     embed = discord.Embed(
         title=PANEL_TITLE,
@@ -788,13 +827,13 @@ def build_shared_embed(guild: discord.Guild) -> discord.Embed:
             "and a moderator will pick it up as soon as one is available.\n"
             "\n"
             "### How it works\n"
-            "**1.** Press **Describe Issue** and tell us what happened, who is involved and when it happened.\n"
-            "**2.** You appear in the **Current queue** below. You get a short ping here when a moderator picks up your request.\n"
-            "**3.** Press **Cancel Request** if you no longer need help.\n"
+            f"{E_PENCIL} **Describe** — press **Describe Issue** and tell us what happened, who is involved and when.\n"
+            f"{E_HOURGLASS} **Wait** — you appear in the **Current queue** below, and get a short ping here when a moderator picks it up.\n"
+            f"{E_X} **Cancel** — press **Cancel Request** if you no longer need help.\n"
             "\n"
-            "*Prefer to talk? You can also wait in the **Waiting for Help** voice channel.*\n"
+            f"-# {E_SPEAKER} Prefer to talk? You can also wait in the **Waiting for Help** voice channel.\n"
             "\n"
-            "### Current queue\n"
+            f"### {E_PEOPLE} Current queue\n"
             f"{queue_text}"
         ),
         color=PURPLE,
@@ -928,11 +967,11 @@ def entry_from_alert(msg: discord.Message, config: dict, origin: str = "vc") -> 
     issue = get_field(embed, "Issue")
     described = bool(issue) and "hasn't described" not in issue
     if claimed_by:
-        status = f"🟣 {claimed_by} is handling your request"
+        status = ps_claimed(claimed_by)
     elif described:
-        status = "🟡 Message sent — waiting for a moderator"
+        status = PS_SENT
     else:
-        status = "🟡 Waiting for a moderator"
+        status = PS_WAITING
     return {
         "alert": msg,
         "origin": origin,
@@ -1044,7 +1083,7 @@ async def close_after_grace(member_id: int):
     m = guild.get_member(member_id) if guild else None
     if m and m.voice and m.voice.channel and m.voice.channel.id in HELP_VC_CONFIG:
         return
-    await close_help_request(member_id, "🔴 Left the queue", PURPLE, alert_footer="Member left")
+    await close_help_request(member_id, f"{E_EXIT} Left the queue", PURPLE, alert_footer="Member left")
 
 
 class DescribeIssueModal(discord.ui.Modal, title="Describe Your Issue"):
@@ -1062,7 +1101,7 @@ class DescribeIssueModal(discord.ui.Modal, title="Describe Your Issue"):
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.send_message(
-            "Got it, thanks. You are now in the queue — a moderator will pick up your request shortly. "
+            f"{E_CHECK} Got it, thanks. You are now in the queue — a moderator will pick up your request shortly. "
             "You will get a ping in this channel when someone is on it.",
             ephemeral=True,
         )
@@ -1082,7 +1121,7 @@ class DescribeIssueModal(discord.ui.Modal, title="Describe Your Issue"):
             config = HELP_VC_CONFIG[vc.id] if vc else DEFAULT_HELP_CONFIG
             if reserve_help_request(member, config, "vc" if vc else "panel"):
                 entry = help_panels[self.member_id]
-                entry.update(described=True, queued=True, queued_at=now, status="🟡 Message sent — waiting for a moderator")
+                entry.update(described=True, queued=True, queued_at=now, status=PS_SENT)
                 created_here = True
                 await _post_help_alert(member, vc, config, ping=False, issue=text)
                 entry = help_panels.get(self.member_id)   # None if it was closed in the meantime
@@ -1111,7 +1150,7 @@ class DescribeIssueModal(discord.ui.Modal, title="Describe Your Issue"):
                     print(f"⚠️ Couldn't add the issue to the mod alert: {e}")
 
             if not entry.get("claimed"):
-                await set_panel_status(self.member_id, "🟡 Message sent — waiting for a moderator", PURPLE)
+                await set_panel_status(self.member_id, PS_SENT, PURPLE)
             elif guild:
                 await refresh_shared_panel(guild)
 
@@ -1120,10 +1159,10 @@ class DescribeIssueModal(discord.ui.Modal, title="Describe Your Issue"):
             print("⚠️ Couldn't find the issue reports channel — check ISSUE_REPORTS_CHANNEL_ID")
         else:
             embed = discord.Embed(
-                title="Issue Report",
+                title=f"{E_PENCIL} Issue Report",
                 description=(
                     f"## New issue from <@{self.member_id}>\n"
-                    "*Sent from the support panel.*\n"
+                    "-# Sent from the support panel\n"
                     "\n"
                     "### Their message\n"
                     f">>> {text}"
@@ -1138,13 +1177,17 @@ class DescribeIssueModal(discord.ui.Modal, title="Describe Your Issue"):
             voice = member.voice.channel if member and member.voice and member.voice.channel else None
             alert_msg = entry.get("alert") if entry else None
 
-            embed.add_field(name="Member", value=f"<@{self.member_id}>", inline=True)
-            embed.add_field(name="User ID", value=f"`{self.member_id}`", inline=True)
-            embed.add_field(name="Submitted", value=discord.utils.format_dt(now, "R"), inline=True)
-            embed.add_field(name="Voice Channel", value=voice.mention if voice else "`Not in a voice channel`", inline=True)
-            embed.add_field(name="Status", value="🟡 `Not seen yet`", inline=True)
+            embed.add_field(name=f"{E_SMILEY} Member", value=f"<@{self.member_id}>", inline=True)
+            embed.add_field(name=f"{E_LINK} User ID", value=f"`{self.member_id}`", inline=True)
+            embed.add_field(name=f"{E_HOURGLASS} Submitted", value=discord.utils.format_dt(now, "R"), inline=True)
+            embed.add_field(
+                name=f"{E_SPEAKER} Voice Channel",
+                value=voice.mention if voice else "`Not in a voice channel`",
+                inline=True,
+            )
+            embed.add_field(name="Status", value=f"{E_HOURGLASS} **Not seen yet**", inline=True)
             if alert_msg is not None:
-                embed.add_field(name="Help Request", value=f"[Jump to request]({alert_msg.jump_url})", inline=True)
+                embed.add_field(name=f"{E_KEY} Help Request", value=f"[Jump to request]({alert_msg.jump_url})", inline=True)
 
             embed.set_footer(
                 text="ELITE LEADERS COMMUNITY • Issue Reports",
@@ -1171,7 +1214,7 @@ class MemberPanelButton(
 
     def __init__(self, action: str):
         if action == "describe":
-            label, emoji = "Describe Issue", None
+            label, emoji = "Describe Issue", DESCRIBE_EMOJI
         else:
             label, emoji = "Cancel Request", CANCEL_EMOJI
         super().__init__(
@@ -1217,7 +1260,7 @@ class MemberPanelButton(
         )
         await close_help_request(
             member_id,
-            "⚪ Cancelled",
+            f"{E_X} Cancelled",
             PURPLE,
             alert_footer="Cancelled",
         )
@@ -1398,7 +1441,7 @@ async def on_member_remove(member: discord.Member):
         if fresh.embeds and fresh.embeds[0].footer.text == VERIFY_OPEN_FOOTER:
             embed = fresh.embeds[0].copy()
             embed.color = PURPLE
-            set_field(embed, "Status", "⚪ `Member left`", inline=True)
+            set_field(embed, "Status", STATUS_LEFT, inline=True)
             embed.set_footer(text="Member left ❌")
             await fresh.edit(embed=embed, view=verify_view(member.id, disabled=True))
             print(f"🚪 {member} left the server — closed their verification card")
@@ -1470,7 +1513,10 @@ async def _send_verification_alert(member: discord.Member, voice_channel: discor
             if time.monotonic() - entry.get("last_edit", 0.0) >= 5:
                 try:
                     embed = existing.embeds[0].copy()
-                    set_field(embed, "Re-joined the voice channel", f"`{entry['rejoins']}` time(s) since this request", inline=False)
+                    set_field(
+                        embed, f"{E_HOURGLASS} Re-joined the voice channel",
+                        f"`{entry['rejoins']}` time(s) since this request", inline=False,
+                    )
                     await existing.edit(embed=embed)
                     entry["last_edit"] = time.monotonic()
                 except discord.HTTPException:
@@ -1513,7 +1559,7 @@ async def _send_verification_alert(member: discord.Member, voice_channel: discor
     if inviter:
         invited_by_text = f"{inviter.mention}\n`{inviter.name}`"
     else:
-        invited_by_text = "`Unknown`\n*vanity URL or unknown invite*"
+        invited_by_text = "`Unknown`\n-# vanity URL or unknown invite"
 
     warning_text = ""
     if NEW_ACCOUNT_WARNING_DAYS:
@@ -1525,33 +1571,33 @@ async def _send_verification_alert(member: discord.Member, voice_channel: discor
                 hours = max(account_age.seconds // 3600, 0)
                 age_label = "less than an hour old" if hours < 1 else f"{hours} hour{'s' if hours != 1 else ''} old"
             warning_text = (
-                f"{WARN_EMOJI} **New account warning**\n"
-                f"> This account is only **{age_label}** (under {NEW_ACCOUNT_WARNING_DAYS} days). "
-                f"Check them carefully before verifying.\n\n"
+                f"{WARN_EMOJI} **New account** — only **{age_label}**\n"
+                f"-# Check them carefully before verifying.\n\n"
             )
 
     embed = discord.Embed(
-        title="Member awaiting verification",
+        title=f"{E_KEY} Verification Request",
         description=(
             f"{warning_text}"
-            f"## {member.mention} is waiting to be verified\n"
-            f"They joined {voice_channel.mention} — *join them, check, then press a button below.*"
+            f"## {member.mention}\n"
+            f"is waiting in {voice_channel.mention} to be verified.\n\n"
+            f"{E_PEOPLE} *Join them, check, then press a button below.*"
         ),
         color=PURPLE,
     )
     embed.set_thumbnail(url=member.display_avatar.url)
-    embed.add_field(name="Member", value=member.mention, inline=True)
-    embed.add_field(name="ID", value=f"`{member.id}`", inline=True)
-    embed.add_field(name="Status", value="🟡 `Waiting`", inline=True)
-    embed.add_field(name="Account Created", value=discord.utils.format_dt(member.created_at, "R"), inline=True)
+    embed.add_field(name=f"{E_SMILEY} Member", value=member.mention, inline=True)
+    embed.add_field(name=f"{E_LINK} ID", value=f"`{member.id}`", inline=True)
+    embed.add_field(name="Status", value=STATUS_WAITING, inline=True)
+    embed.add_field(name=f"{E_HOURGLASS} Account Created", value=discord.utils.format_dt(member.created_at, "R"), inline=True)
     embed.add_field(
-        name="Joined Server",
+        name=f"{E_EXIT} Joined Server",
         value=discord.utils.format_dt(member.joined_at, "R") if member.joined_at else "`Unknown`",
         inline=True,
     )
-    embed.add_field(name="Invited By", value=invited_by_text, inline=True)
+    embed.add_field(name=f"{E_CROWN} Invited By", value=invited_by_text, inline=True)
     if previous_reason:
-        embed.add_field(name="Previous Rejection", value=previous_reason[:1024], inline=False)
+        embed.add_field(name=f"{E_SHIELD_X} Previous Rejection", value=previous_reason[:1024], inline=False)
     embed.set_footer(text=VERIFY_OPEN_FOOTER)
     embed.timestamp = discord.utils.utcnow()
 
@@ -1585,7 +1631,7 @@ def reserve_help_request(member: discord.Member, config: dict, origin: str = "vc
         "queued": False,
         "claimed": False,
         "show": config.get("send_member_panel", True),
-        "status": "🟡 Waiting for a moderator",
+        "status": PS_WAITING,
         "joined_at": now,
         "queued_at": None,
     }
@@ -1614,22 +1660,29 @@ async def _post_help_alert(member: discord.Member, voice_channel, config: dict, 
     print(f"📤 Sending help alert for {member} ({'voice' if voice_channel else 'panel'})")
 
     if voice_channel is not None:
-        where = f"Waiting in {voice_channel.mention} — *join them to help.*"
+        where = f"is waiting in {voice_channel.mention}\n{E_PEOPLE} *Join them to help.*"
     else:
-        where = "Sent from the support panel — *they are **not** in a voice channel, contact them directly.*"
+        where = (
+            "sent this from the support panel\n"
+            f"{E_WARN} *They are **not** in a voice channel — contact them directly.*"
+        )
 
     embed = discord.Embed(
-        title=f"{emoji} Help Request".strip(),
-        description=f"## {member.mention} needs a moderator\n{where}",
+        title=f"{emoji or E_CROWN} Help Request".strip(),
+        description=f"## {member.mention}\n{where}",
         color=PURPLE,
     )
     embed.set_thumbnail(url=member.display_avatar.url)
-    embed.add_field(name="Member", value=member.mention, inline=True)
-    embed.add_field(name="ID", value=f"`{member.id}`", inline=True)
-    embed.add_field(name="Account Created", value=discord.utils.format_dt(member.created_at, "R"), inline=True)
-    embed.add_field(name="Voice Channel", value=voice_channel.mention if voice_channel else "`Not in a voice channel`", inline=True)
-    embed.add_field(name="Waiting Since", value=discord.utils.format_dt(discord.utils.utcnow(), "R"), inline=True)
-    embed.add_field(name="Status", value="🟡 `Waiting`", inline=True)
+    embed.add_field(name=f"{E_SMILEY} Member", value=member.mention, inline=True)
+    embed.add_field(name=f"{E_LINK} ID", value=f"`{member.id}`", inline=True)
+    embed.add_field(name="Status", value=STATUS_WAITING, inline=True)
+    embed.add_field(name=f"{E_HOURGLASS} Account Created", value=discord.utils.format_dt(member.created_at, "R"), inline=True)
+    embed.add_field(
+        name="Voice Channel",
+        value=voice_channel.mention if voice_channel else "`Not in a voice channel`",
+        inline=True,
+    )
+    embed.add_field(name=f"{E_HOURGLASS} Waiting Since", value=discord.utils.format_dt(discord.utils.utcnow(), "R"), inline=True)
     if issue or config.get("send_member_panel", True):
         embed.add_field(
             name="Issue",
@@ -1711,11 +1764,11 @@ async def on_voice_state_update(
             if member.id not in _leave_tasks:
                 _leave_tasks[member.id] = asyncio.create_task(close_after_grace(member.id))
                 entry0["status_before"] = entry0["status"]
-                await set_panel_status(member.id, "🟠 Disconnected — waiting for them to reconnect")
+                await set_panel_status(member.id, PS_DISCONNECTED)
         elif after_id != before_id:
             await close_help_request(
                 member.id,
-                "🟢 Resolved — a moderator moved you",
+                f"{E_SHIELD_OK} Resolved — a moderator moved you",
                 PURPLE,
                 alert_footer="Member moved",
                 lock_alert=False,
@@ -1747,7 +1800,7 @@ async def on_voice_state_update(
                 pending.cancel()
                 entry = help_panels.get(member.id)
                 if entry is not None:
-                    await set_panel_status(member.id, entry.pop("status_before", "🟡 Waiting for a moderator"))
+                    await set_panel_status(member.id, entry.pop("status_before", PS_WAITING))
             if isinstance(after.channel, (discord.VoiceChannel, discord.StageChannel)):
                 await send_help_alert(
                     member,
