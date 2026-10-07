@@ -232,6 +232,8 @@ def set_field(embed: discord.Embed, name: str, value: str, inline: bool = False)
         if f.name == name:
             embed.set_field_at(i, name=name, value=value, inline=inline)
             return
+    if name == "Status":
+        return  # the verify / help cards no longer show a Status field; footer + "by" fields say it
     embed.add_field(name=name, value=value, inline=inline)
 
 
@@ -635,7 +637,8 @@ def _is_claimed(embed: discord.Embed) -> bool:
 def _alert_origin(msg: discord.Message) -> str:
     """'panel' if the request was sent from #describe-issue by someone who is not in a voice channel."""
     if msg.embeds:
-        value = get_field(msg.embeds[0], "Voice Channel") or ""
+        embed = msg.embeds[0]
+        value = (get_field(embed, "Voice Channel") or "") + (embed.description or "")
         if "Not in a voice channel" in value:
             return "panel"
     return "vc"
@@ -1557,9 +1560,9 @@ async def _send_verification_alert(member: discord.Member, voice_channel: discor
 
     inviter = member_inviters.get(member.id)
     if inviter:
-        invited_by_text = f"{inviter.mention}\n`{inviter.name}`"
+        invited_by_text = f"{inviter.mention} (`{inviter.name}`)"
     else:
-        invited_by_text = "`Unknown`\n-# vanity URL or unknown invite"
+        invited_by_text = "`Unknown` — vanity URL or unknown invite"
 
     warning_text = ""
     if NEW_ACCOUNT_WARNING_DAYS:
@@ -1576,7 +1579,7 @@ async def _send_verification_alert(member: discord.Member, voice_channel: discor
             )
 
     embed = discord.Embed(
-        title=f"{E_KEY} Verification Request",
+        title="Verification Request",
         description=(
             f"{warning_text}"
             f"## {member.mention}\n"
@@ -1587,15 +1590,13 @@ async def _send_verification_alert(member: discord.Member, voice_channel: discor
     )
     embed.set_thumbnail(url=member.display_avatar.url)
     embed.add_field(name=f"{E_PEOPLE} Member", value=member.mention, inline=True)
-    embed.add_field(name=f"{E_LINK} ID", value=f"`{member.id}`", inline=True)
-    embed.add_field(name="Status", value=STATUS_WAITING, inline=True)
     embed.add_field(name=f"{E_HOURGLASS} Created", value=discord.utils.format_dt(member.created_at, "R"), inline=True)
     embed.add_field(
         name=f"{E_EXIT} Joined",
         value=discord.utils.format_dt(member.joined_at, "R") if member.joined_at else "`Unknown`",
         inline=True,
     )
-    embed.add_field(name=f"{E_CROWN} Invited By", value=invited_by_text, inline=True)
+    embed.add_field(name=f"{E_CROWN} Invited By", value=invited_by_text, inline=False)
     if previous_reason:
         embed.add_field(name=f"{E_SHIELD_X} Previous Rejection", value=previous_reason[:1024], inline=False)
     embed.set_footer(text=VERIFY_OPEN_FOOTER)
@@ -1660,28 +1661,19 @@ async def _post_help_alert(member: discord.Member, voice_channel, config: dict, 
     print(f"📤 Sending help alert for {member} ({'voice' if voice_channel else 'panel'})")
 
     if voice_channel is not None:
-        where = f"is waiting in {voice_channel.mention}\n{E_PEOPLE} *Join them to help.*"
+        where = f"is waiting in {voice_channel.mention}\n-# Join them to help."
     else:
-        where = (
-            "sent this from the support panel\n"
-            f"{E_WARN} *They are **not** in a voice channel — contact them directly.*"
-        )
+        # "Not in a voice channel" must stay in this text: the bot uses it to tell panel requests apart.
+        where = "sent a request from the support panel\n-# Not in a voice channel — contact them directly."
 
     embed = discord.Embed(
-        title=f"{emoji or E_CROWN} Help Request".strip(),
+        title="Help Request",
         description=f"## {member.mention}\n{where}",
         color=PURPLE,
     )
     embed.set_thumbnail(url=member.display_avatar.url)
-    embed.add_field(name=f"{E_SMILEY} Member", value=member.mention, inline=True)
-    embed.add_field(name=f"{E_LINK} ID", value=f"`{member.id}`", inline=True)
-    embed.add_field(name="Status", value=STATUS_WAITING, inline=True)
-    embed.add_field(name=f"{E_HOURGLASS} Account Created", value=discord.utils.format_dt(member.created_at, "R"), inline=True)
-    embed.add_field(
-        name="Voice Channel",
-        value=voice_channel.mention if voice_channel else "`Not in a voice channel`",
-        inline=True,
-    )
+    embed.add_field(name=f"{E_PEOPLE} Member", value=member.mention, inline=True)
+    embed.add_field(name=f"{E_HOURGLASS} Created", value=discord.utils.format_dt(member.created_at, "R"), inline=True)
     embed.add_field(name=f"{E_HOURGLASS} Waiting Since", value=discord.utils.format_dt(discord.utils.utcnow(), "R"), inline=True)
     if issue or config.get("send_member_panel", True):
         embed.add_field(
