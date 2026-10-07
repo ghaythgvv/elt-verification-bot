@@ -147,6 +147,32 @@ async function denyBlockedRole(channel, config) {
   }
 }
 
+// Moderators must always be able to see, enter, talk and type in every
+// temp/game channel, no matter what the category, the lock button or
+// blockedRoleId says. A role-specific "allow" beats the @everyone
+// "Connect: false" that locking sets, so mods can still get into locked
+// channels. This runs AFTER denyBlockedRole (so even if the mod role was put
+// in blockedRoleId by mistake, mods still get in) and BEFORE the owner's own
+// overwrite. Set config.modRoleId to override the ID below.
+const MOD_ROLE_ID = '1513904125086011402';
+const MOD_CHANNEL_PERMISSIONS = {
+  ViewChannel: true,
+  Connect: true,
+  Speak: true,
+  SendMessages: true,
+  ReadMessageHistory: true,
+};
+
+async function grantModAccess(channel, config) {
+  const roleId = (config && config.modRoleId) || MOD_ROLE_ID;
+  if (!roleId) return;
+  try {
+    await channel.permissionOverwrites.edit(roleId, MOD_CHANNEL_PERMISSIONS);
+  } catch (err) {
+    console.warn(`[permissions] could not grant mod access on ${channel.name}: ${err.message}`);
+  }
+}
+
 // Saves the channel's current name/limit/locked/trusted state under its
 // owner, so the next channel that owner creates can start off the same way.
 // Called right before a temp channel is torn down, wherever that happens.
@@ -271,15 +297,17 @@ async function createTempChannel(member, guild, config) {
   // Order matters: sync to the category first (so this channel behaves
   // like any other channel a normal member already sees in there), then
   // force ViewChannel on for everyone regardless of what the category
-  // said, then apply the blocked-role deny (if configured) on top, then
-  // finally the owner's own overwrite — a member-specific overwrite always
-  // beats a role-specific one, so this order guarantees the owner is never
-  // the one who ends up locked out by any of the previous steps.
+  // said, then apply the blocked-role deny (if configured), then give the
+  // moderator role guaranteed access, then finally the owner's own
+  // overwrite — a member-specific overwrite always beats a role-specific
+  // one, so this order guarantees the owner is never the one who ends up
+  // locked out by any of the previous steps.
   await syncToCategoryPermissions(channel);
   await channel.permissionOverwrites.edit(guild.roles.everyone, { ViewChannel: true }).catch((err) => {
     console.warn(`[permissions] could not force ViewChannel on ${channel.name}: ${err.message}`);
   });
   await denyBlockedRole(channel, config);
+  await grantModAccess(channel, config);
   await updateOwnerPermissions(channel, null, member.id);
 
   // Restore the locked state and re-grant anyone who was trusted before —
@@ -357,13 +385,14 @@ async function createGameChannel(member, guild, config) {
   // Same ordering as createTempChannel above: category sync, then force
   // everyone able to see the channel regardless of what the category
   // allows (game channels should be visible to any member, not gated),
-  // then the blocked-role deny, then the owner's own overwrite last so it
-  // always wins.
+  // then the blocked-role deny, then moderator access, then the owner's own
+  // overwrite last so it always wins.
   await syncToCategoryPermissions(channel);
   await channel.permissionOverwrites.edit(guild.roles.everyone, { ViewChannel: true }).catch((err) => {
     console.warn(`[permissions] could not force ViewChannel on ${channel.name}: ${err.message}`);
   });
   await denyBlockedRole(channel, config);
+  await grantModAccess(channel, config);
   await updateOwnerPermissions(channel, null, member.id);
 
   try {
@@ -544,8 +573,23 @@ async function sweepEmptyChannels(client) {
   }
 }
 
+// Gives the moderator role access to every temp/game channel that already
+// exists (created before this fix, or while the bot was down). Runs once at
+// startup, after empty channels have been swept away.
+async function backfillModAccess(client) {
+  const all = storage.getAllTempChannels();
+  for (const channelId of Object.keys(all)) {
+    const data = all[channelId];
+    const guild = client.guilds.cache.get(data.guildId);
+    const channel = guild && guild.channels.cache.get(channelId);
+    if (!channel) continue;
+    await grantModAccess(channel, storage.getGuildConfig(data.guildId) || {});
+  }
+}
+
 async function reconcileOnStartup(client) {
   await sweepEmptyChannels(client);
+  await backfillModAccess(client);
   startPeriodicCleanup(client);
 }
 
