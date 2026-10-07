@@ -482,12 +482,12 @@ class RejectReasonModal(discord.ui.Modal, title="Reject Member"):
         embed = message.embeds[0].copy()
         embed.color = PURPLE
         set_field(
-            embed, "Rejected by",
-            f"{interaction.user.mention} • {discord.utils.format_dt(discord.utils.utcnow(), 'R')}",
+            embed, "Rejected",
+            f"❌ {interaction.user.mention} • {discord.utils.format_dt(discord.utils.utcnow(), 'R')}",
             inline=False,
         )
         set_field(embed, "Reason", f">>> {reason}"[:1024], inline=False)
-        embed.set_footer(text="Rejected")
+        embed.set_footer(text="Rejected ❌")
         await interaction.response.edit_message(embed=embed, view=verify_view(self.member_id, disabled=True))
 
         notified = False
@@ -580,11 +580,11 @@ class VerifyButton(
 
         embed.color = PURPLE
         set_field(
-            embed, "Verified by",
-            f"{interaction.user.mention} • {discord.utils.format_dt(discord.utils.utcnow(), 'R')}",
+            embed, "Verified",
+            f"☑️ {interaction.user.mention} • {discord.utils.format_dt(discord.utils.utcnow(), 'R')}",
             inline=False,
         )
-        embed.set_footer(text="Verified")
+        embed.set_footer(text="Verified ☑️")
         member_inviters.pop(self.member_id, None)
         await interaction.edit_original_response(embed=embed, view=verify_view(self.member_id, disabled=True))
 
@@ -1566,29 +1566,26 @@ async def _send_verification_alert(member: discord.Member, voice_channel: discor
                 f"-# Check them carefully before verifying.\n\n"
             )
 
+    created_text = discord.utils.format_dt(member.created_at, "R")
+    joined_text = discord.utils.format_dt(member.joined_at, "R") if member.joined_at else "`Unknown`"
+
     embed = discord.Embed(
-        title="Verification Request",
+        title="Member awaiting verification",
         description=(
             f"{warning_text}"
-            f"## {member.mention}\n"
-            f"is waiting in {voice_channel.mention} to be verified.\n"
-            f"-# Join them, check, then press a button below."
+            f"Member: {member.mention}\n"
+            f"ID: `{member.id}`\n"
+            f"Account created: {created_text}\n"
+            f"Joined server: {joined_text}\n"
+            f"Invited by: {invited_by_text}\n"
+            f"Joined voice channel: {voice_channel.mention}"
         ),
         color=PURPLE,
     )
     embed.set_thumbnail(url=member.display_avatar.url)
-    embed.add_field(name="Member", value=member.mention, inline=True)
-    embed.add_field(name="Created", value=discord.utils.format_dt(member.created_at, "R"), inline=True)
-    embed.add_field(
-        name="Joined",
-        value=discord.utils.format_dt(member.joined_at, "R") if member.joined_at else "`Unknown`",
-        inline=True,
-    )
-    embed.add_field(name="Invited By", value=invited_by_text, inline=False)
     if previous_reason:
-        embed.add_field(name="Previous Rejection", value=previous_reason[:1024], inline=False)
+        embed.add_field(name="Previous rejection", value=previous_reason[:1024], inline=False)
     embed.set_footer(text=VERIFY_OPEN_FOOTER)
-    embed.timestamp = discord.utils.utcnow()
 
     try:
         sent = await send_with_retry(
