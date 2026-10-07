@@ -1580,18 +1580,18 @@ async def _send_verification_alert(member: discord.Member, voice_channel: discor
         description=(
             f"{warning_text}"
             f"## {member.mention}\n"
-            f"is waiting in {voice_channel.mention} to be verified.\n\n"
-            f"{E_PEOPLE} *Join them, check, then press a button below.*"
+            f"is waiting in {voice_channel.mention} to be verified.\n"
+            f"-# Join them, check, then press a button below."
         ),
         color=PURPLE,
     )
     embed.set_thumbnail(url=member.display_avatar.url)
-    embed.add_field(name=f"{E_SMILEY} Member", value=member.mention, inline=True)
+    embed.add_field(name=f"{E_PEOPLE} Member", value=member.mention, inline=True)
     embed.add_field(name=f"{E_LINK} ID", value=f"`{member.id}`", inline=True)
     embed.add_field(name="Status", value=STATUS_WAITING, inline=True)
-    embed.add_field(name=f"{E_HOURGLASS} Account Created", value=discord.utils.format_dt(member.created_at, "R"), inline=True)
+    embed.add_field(name=f"{E_HOURGLASS} Created", value=discord.utils.format_dt(member.created_at, "R"), inline=True)
     embed.add_field(
-        name=f"{E_EXIT} Joined Server",
+        name=f"{E_EXIT} Joined",
         value=discord.utils.format_dt(member.joined_at, "R") if member.joined_at else "`Unknown`",
         inline=True,
     )
