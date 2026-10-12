@@ -1,7 +1,14 @@
 """
-Discord Verification Bot  (v2.3)
+Discord Verification Bot  (v2.4)
 =======================================
-What's new in v2.3 (text-only panels + fixes):
+What's new in v2.4:
+    - Pressing Verify now asks the moderator: Boy / Girl / Not sure is a girl.
+      The member gets the matching role (see GENDER_ROLES) plus Verified + MEMBER, and loses Unverified.
+    - New custom X emoji on the Reject and Cancel Request buttons.
+    - Fix: Verify and Reject can no longer both go through when two moderators press at the same time.
+    - Fix: roles are added BEFORE Unverified is removed, so a failure never leaves a member with no roles.
+
+v2.3 (text-only panels + fixes):
     - The verification card, help request card, support panel, issue report and DM have NO emojis.
       Only the BUTTONS keep their emojis. The panel title "Support Request Received" stays.
     - Fix: a member who leaves the server no longer stays stuck in the support queue.
@@ -34,7 +41,8 @@ Before running:
     - Enable MESSAGE CONTENT INTENT in the Developer Portal (Bot > Privileged Gateway Intents),
       and let the bot View Channel + Read Message History in the -INVITE channel.
     - Enable SERVER MEMBERS INTENT for your bot in the Discord Developer Portal.
-    - Give the bot "Manage Nicknames" and put the bot's role ABOVE the roles it must rename.
+    - Give the bot "Manage Nicknames" and "Manage Roles", and put the bot's role ABOVE the roles it
+      must rename / give (Verified, MEMBER, and the three GENDER_ROLES).
     - The bot must be in the server that owns the custom emojis.
     - Set DISCORD_TOKEN as an environment variable (Railway > Variables).
 """
@@ -101,11 +109,17 @@ _STRIPPABLE_EMOJIS = sorted(ALERT_EMOJIS | LEGACY_ALERT_EMOJIS, key=len, reverse
 UNVERIFIED_ROLE_ID = 1513904174079934657
 VERIFIED_ROLE_ID = 1513904156350353511
 EXTRA_ROLES_ON_VERIFY = [1513904151309058159]  # MEMBER role
+# Role given depending on what the moderator picks when pressing Verify
+GENDER_ROLES = {
+    "boy": ("Boy", 1513904153049436332),
+    "girl": ("Girl", 1545082482855125013),
+    "unsure": ("Not sure is a girl", 1513904149085814795),
+}
 MOD_ROLE_ID = 1513904125086011402               # moderators: always see / enter / talk in report rooms
 
 # ---------------- Button emojis (the ONLY emojis left - cards and panels are text only) ----------------
 VERIFY_EMOJI = discord.PartialEmoji(name="positivo", id=1553555472811040788)
-REJECT_EMOJI = discord.PartialEmoji(name="purple_x", id=1554671367142645770)
+REJECT_EMOJI = discord.PartialEmoji(name="purple_x", id=1559031608068022394)
 CLAIM_EMOJI = discord.PartialEmoji(name="crown", id=1554186011809021953)
 RESOLVE_EMOJI = discord.PartialEmoji(name="shield_check", id=1553472890601734325)
 SEEN_EMOJI = discord.PartialEmoji(name="positivo", id=1553555472811040788)
@@ -161,6 +175,7 @@ help_panels = {}
 
 verify_alerts: dict[int, dict] = {}
 _verify_locks: dict[int, asyncio.Lock] = {}
+_verify_action_locks: dict[int, asyncio.Lock] = {}   # one Verify / Reject at a time per member
 member_report_rooms: dict[int, int] = {}
 _report_locks: dict[int, asyncio.Lock] = {}
 _report_last_created: dict[int, float] = {}
@@ -182,7 +197,7 @@ PING_ON_JOIN = True           # short ping when a member joins Waiting for Help 
 PING_DELETE_AFTER = 8
 JOIN_PING_TEXT = "your request is in — check the panel and press **Describe Issue** to tell us what is wrong."
 NOTIFY_DELETE_AFTER = 12      # "a moderator picked up your request" pings stay a bit longer
-CANCEL_EMOJI = discord.PartialEmoji(name="cancel", id=1554671367142645770, animated=False)
+CANCEL_EMOJI = discord.PartialEmoji(name="cancel", id=1559031608068022394, animated=False)
 PANEL_TITLE = "Support Request Received"
 PURPLE = discord.Color.purple()
 _bg_tasks: set = set()
@@ -531,20 +546,30 @@ class RejectReasonModal(discord.ui.Modal, title="Reject Member"):
         message = interaction.message
         if message is None or not message.embeds:
             return await interaction.response.send_message("Couldn't find the request message.", ephemeral=True)
-        if _already_done(message, VERIFY_DONE_FOOTERS):
-            return await interaction.response.send_message("This request was already handled.", ephemeral=True)
 
         reason = self.reason.value.strip()
-        embed = message.embeds[0].copy()
-        embed.color = PURPLE
-        set_field(
-            embed, "Rejected",
-            f"❌ {interaction.user.mention} • {discord.utils.format_dt(discord.utils.utcnow(), 'R')}",
-            inline=False,
-        )
-        set_field(embed, "Reason", f">>> {reason}"[:1024], inline=False)
-        embed.set_footer(text="Rejected ❌")
-        await interaction.response.edit_message(embed=embed, view=verify_view(self.member_id, disabled=True))
+
+        # One Verify / Reject at a time per member, and always re-read the card: the copy in the
+        # interaction can be stale if another moderator handled the request a second ago.
+        lock = _verify_action_locks.setdefault(self.member_id, asyncio.Lock())
+        async with lock:
+            try:
+                fresh = await message.channel.fetch_message(message.id)
+            except discord.HTTPException:
+                fresh = message
+            if _already_done(fresh, VERIFY_DONE_FOOTERS):
+                return await interaction.response.send_message("This request was already handled.", ephemeral=True)
+
+            embed = fresh.embeds[0].copy()
+            embed.color = PURPLE
+            set_field(
+                embed, "Rejected",
+                f"❌ {interaction.user.mention} • {discord.utils.format_dt(discord.utils.utcnow(), 'R')}",
+                inline=False,
+            )
+            set_field(embed, "Reason", f">>> {reason}"[:1024], inline=False)
+            embed.set_footer(text="Rejected ❌")
+            await interaction.response.edit_message(embed=embed, view=verify_view(self.member_id, disabled=True))
 
         notified = False
         if DM_ON_REJECT and interaction.guild is not None:
@@ -594,65 +619,119 @@ class VerifyButton(
                 return await interaction.response.send_message("This request was already handled.", ephemeral=True)
             return await interaction.response.send_modal(RejectReasonModal(self.member_id))
 
-        await interaction.response.defer()
-
+        # Verify: ask boy / girl / not sure first, the roles are given after the choice.
         if _already_done(interaction.message, VERIFY_DONE_FOOTERS):
-            return await interaction.followup.send("This request was already handled.", ephemeral=True)
+            return await interaction.response.send_message("This request was already handled.", ephemeral=True)
+        await interaction.response.send_message(
+            f"Is <@{self.member_id}> a boy or a girl?",
+            view=GenderChoiceView(interaction.message, self.member_id),
+            ephemeral=True,
+        )
 
-        embed = interaction.message.embeds[0].copy()
 
-        guild = interaction.guild
-        member = guild.get_member(self.member_id)
+async def finish_verification(
+    interaction: discord.Interaction, card: discord.Message, member_id: int, gender_key: str
+) -> str | None:
+    """Gives the roles and closes the card. Returns an error text, or None when it worked."""
+    guild = interaction.guild
+    lock = _verify_action_locks.setdefault(member_id, asyncio.Lock())
+    async with lock:
+        try:
+            fresh = await card.channel.fetch_message(card.id)
+        except discord.HTTPException:
+            fresh = card
+        if _already_done(fresh, VERIFY_DONE_FOOTERS):
+            return "This request was already handled."
+
+        member = guild.get_member(member_id)
         if member is None:
             try:
-                member = await guild.fetch_member(self.member_id)
+                member = await guild.fetch_member(member_id)
             except discord.HTTPException:
                 member = None
         if member is None:
-            return await interaction.followup.send(
-                "That member isn't in the server anymore (they may have left).", ephemeral=True
-            )
+            return "That member isn't in the server anymore (they may have left)."
+
+        label, gender_role_id = GENDER_ROLES[gender_key]
+        gender_role = guild.get_role(gender_role_id)
+        if gender_role is None:
+            return "I can't find that role. Check GENDER_ROLES."
 
         unverified_role = guild.get_role(UNVERIFIED_ROLE_ID)
         verified_role = guild.get_role(VERIFIED_ROLE_ID)
+        extra_roles = [guild.get_role(rid) for rid in EXTRA_ROLES_ON_VERIFY]
+        to_add = [r for r in (verified_role, gender_role, *extra_roles) if r is not None and r not in member.roles]
 
         try:
+            # Add first, remove Unverified last: if something fails the member is never left without roles.
+            if to_add:
+                await member.add_roles(*to_add, reason=f"Verified by {interaction.user} ({label})")
             if unverified_role and unverified_role in member.roles:
                 await member.remove_roles(unverified_role, reason=f"Verified by {interaction.user}")
-            if verified_role:
-                await member.add_roles(verified_role, reason=f"Verified by {interaction.user}")
-            for rid in EXTRA_ROLES_ON_VERIFY:
-                r = guild.get_role(rid)
-                if r:
-                    await member.add_roles(r, reason="Extra role after verification")
         except discord.Forbidden:
-            return await interaction.followup.send(
-                "The bot doesn't have enough permission to change roles (make sure the bot's role is above the roles it manages).",
-                ephemeral=True,
-            )
+            return "I don't have enough permission. Move the bot's role above the roles it gives."
         except discord.HTTPException as e:
             print(f"❌ Failed to change roles for {member}: {e}")
-            return await interaction.followup.send("Something went wrong while changing roles. Try again.", ephemeral=True)
+            return "Something went wrong while changing roles. Try again."
 
+        embed = fresh.embeds[0].copy()
         embed.color = PURPLE
         set_field(
             embed, "Verified",
             f"☑️ {interaction.user.mention} • {discord.utils.format_dt(discord.utils.utcnow(), 'R')}",
             inline=False,
         )
+        set_field(embed, "Gender", label, inline=True)
         embed.set_footer(text="Verified ☑️")
-        member_inviters.pop(self.member_id, None)
-        await interaction.edit_original_response(embed=embed, view=verify_view(self.member_id, disabled=True))
+        member_inviters.pop(member_id, None)
+        try:
+            await fresh.edit(embed=embed, view=verify_view(member_id, disabled=True))
+        except discord.HTTPException as e:
+            print(f"⚠️ Couldn't update the verification card: {e}")
 
-        if WELCOME_CHANNEL_ID:
-            welcome_channel = guild.get_channel(WELCOME_CHANNEL_ID)
-            if welcome_channel:
-                try:
-                    await welcome_channel.send(
-                        f"Welcome {member.mention}, you're verified — glad to have you in the server!"
-                    )
-                except discord.HTTPException as e:
-                    print(f"⚠️ Couldn't send welcome message: {e}")
+    if WELCOME_CHANNEL_ID:
+        welcome_channel = guild.get_channel(WELCOME_CHANNEL_ID)
+        if welcome_channel:
+            try:
+                await welcome_channel.send(
+                    f"Welcome {member.mention}, you're verified — glad to have you in the server!"
+                )
+            except discord.HTTPException as e:
+                print(f"⚠️ Couldn't send welcome message: {e}")
+    return None
+
+
+class GenderChoiceView(discord.ui.View):
+    """The 3 buttons only the moderator who pressed Verify can see."""
+
+    def __init__(self, card: discord.Message, member_id: int):
+        super().__init__(timeout=120)
+        self.card = card
+        self.member_id = member_id
+
+    async def _pick(self, interaction: discord.Interaction, key: str):
+        await interaction.response.defer()
+        error = await finish_verification(interaction, self.card, self.member_id, key)
+        if error:
+            await interaction.edit_original_response(content=error, view=None)
+        else:
+            label = GENDER_ROLES[key][0]
+            await interaction.edit_original_response(
+                content=f"Verified <@{self.member_id}> as **{label}**.", view=None
+            )
+        self.stop()
+
+    @discord.ui.button(label="Boy", style=discord.ButtonStyle.secondary)
+    async def boy(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._pick(interaction, "boy")
+
+    @discord.ui.button(label="Girl", style=discord.ButtonStyle.secondary)
+    async def girl(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._pick(interaction, "girl")
+
+    @discord.ui.button(label="Not sure is a girl", style=discord.ButtonStyle.secondary)
+    async def unsure(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._pick(interaction, "unsure")
 
 
 def verify_view(member_id: int, disabled: bool = False) -> discord.ui.View:
