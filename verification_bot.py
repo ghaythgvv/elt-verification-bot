@@ -2,7 +2,7 @@
 Discord Verification Bot  (v2.4)
 =======================================
 What's new in v2.4:
-    - Pressing Verify now asks the moderator: Boy / Girl / Not sure is a girl.
+    - Pressing Verify now asks the moderator: Boy / Girl / Not sure if it’s a girl.
       The member gets the matching role (see GENDER_ROLES) plus Verified + MEMBER, and loses Unverified.
     - New custom X emoji on the Reject and Cancel Request buttons.
     - Fix: Verify and Reject can no longer both go through when two moderators press at the same time.
@@ -113,7 +113,7 @@ EXTRA_ROLES_ON_VERIFY = [1513904151309058159]  # MEMBER role
 GENDER_ROLES = {
     "boy": ("Boy", 1513904153049436332),
     "girl": ("Girl", 1545082482855125013),
-    "unsure": ("Not sure is a girl", 1513904149085814795),
+    "unsure": ("Not sure if it’s a girl", 1513904149085814795),
 }
 MOD_ROLE_ID = 1513904125086011402               # moderators: always see / enter / talk in report rooms
 
@@ -197,7 +197,7 @@ PING_ON_JOIN = True           # short ping when a member joins Waiting for Help 
 PING_DELETE_AFTER = 8
 JOIN_PING_TEXT = "your request is in — check the panel and press **Describe Issue** to tell us what is wrong."
 NOTIFY_DELETE_AFTER = 12      # "a moderator picked up your request" pings stay a bit longer
-CANCEL_EMOJI = discord.PartialEmoji(name="cancel", id=1559031608068022394, animated=False)
+CANCEL_EMOJI = discord.PartialEmoji(name="purple_x", id=1559031608068022394, animated=False)
 PANEL_TITLE = "Support Request Received"
 PURPLE = discord.Color.purple()
 _bg_tasks: set = set()
@@ -729,7 +729,7 @@ class GenderChoiceView(discord.ui.View):
     async def girl(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._pick(interaction, "girl")
 
-    @discord.ui.button(label="Not sure is a girl", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="Not sure if it’s a girl", style=discord.ButtonStyle.secondary)
     async def unsure(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._pick(interaction, "unsure")
 
