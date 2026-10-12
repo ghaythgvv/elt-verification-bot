@@ -119,7 +119,10 @@ MOD_ROLE_ID = 1513904125086011402               # moderators: always see / enter
 
 # ---------------- Button emojis (the ONLY emojis left - cards and panels are text only) ----------------
 VERIFY_EMOJI = discord.PartialEmoji(name="positivo", id=1553555472811040788)
-REJECT_EMOJI = discord.PartialEmoji(name="purple_x", id=1559031608068022394)
+# X emoji for Reject + Cancel Request. Using the normal ❌ until a custom X emoji ID that Discord accepts is found.
+# To use a custom one later: discord.PartialEmoji(name="purple_x", id=THE_ID)
+X_EMOJI = discord.PartialEmoji(name="❌")
+REJECT_EMOJI = X_EMOJI
 CLAIM_EMOJI = discord.PartialEmoji(name="crown", id=1554186011809021953)
 RESOLVE_EMOJI = discord.PartialEmoji(name="shield_check", id=1553472890601734325)
 SEEN_EMOJI = discord.PartialEmoji(name="positivo", id=1553555472811040788)
@@ -197,7 +200,7 @@ PING_ON_JOIN = True           # short ping when a member joins Waiting for Help 
 PING_DELETE_AFTER = 8
 JOIN_PING_TEXT = "your request is in — check the panel and press **Describe Issue** to tell us what is wrong."
 NOTIFY_DELETE_AFTER = 12      # "a moderator picked up your request" pings stay a bit longer
-CANCEL_EMOJI = discord.PartialEmoji(name="purple_x", id=1559031608068022394, animated=False)
+CANCEL_EMOJI = X_EMOJI
 PANEL_TITLE = "Support Request Received"
 PURPLE = discord.Color.purple()
 _bg_tasks: set = set()
