@@ -1,6 +1,11 @@
 """
-Discord Verification Bot  (v2.4)
+Discord Verification Bot  (v2.5)
 =======================================
+What's new in v2.5:
+    - "Invited by" is now found reliably: the bot reads the -INVITE log posts from the minutes around
+      the member's join time (works even if the join was days ago), matches by ID or by name,
+      and saves the inviter right after a member joins so the card still works if the log is cleaned.
+
 What's new in v2.4:
     - Pressing Verify now asks the moderator: Boy / Girl / Not sure if it’s a girl.
       The member gets the matching role (see GENDER_ROLES) plus Verified + MEMBER, and loses Unverified.
@@ -74,7 +79,11 @@ ISSUE_REPORTS_CHANNEL_ID = 1553196616146493460  # channel where "Describe Issue"
 # The -INVITE log channel (InviteLogger posts "X just joined. They were invited by Y ..." there).
 # Paste its ID for 100% reliability. If left as None the bot finds a text channel whose name ends in "invite".
 INVITE_LOG_CHANNEL_ID = None
-INVITE_LOG_SCAN_LIMIT = 300                      # how many recent log messages to search
+INVITE_LOG_SCAN_LIMIT = 300                      # (old setting, no longer used by the lookup)
+INVITE_LOG_WINDOW_BEFORE = timedelta(minutes=2)    # look this far before the member's join time
+INVITE_LOG_WINDOW_AFTER = timedelta(minutes=20)    # ...and this far after it
+INVITE_LOG_WIDE_SCAN_LIMIT = 1500                  # last-resort wide scan
+inviter_text_cache: dict[int, str] = {}            # member_id -> "who invited them"
 
 # Per-VC settings for the "waiting for help" flow:
 #   emoji: shown in the mod alert title | send_member_panel: list members on the shared panel queue
@@ -1544,6 +1553,11 @@ async def on_member_join(member: discord.Member):
     except discord.HTTPException as e:
         print(f"⚠️ Failed to read invites: {e}")
 
+    # Wait for InviteLogger to post, then remember who invited this member.
+    task = asyncio.create_task(prefetch_inviter(member))
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+
 
 @bot.event
 async def on_member_remove(member: discord.Member):
@@ -1565,6 +1579,8 @@ async def on_member_remove(member: discord.Member):
         if channel is not None:
             msg = await find_latest_verification(channel, member.id)
     if msg is None:
+        member_inviters.pop(member.id, None)
+        inviter_text_cache.pop(member.id, None)
         return
 
     try:
@@ -1579,6 +1595,7 @@ async def on_member_remove(member: discord.Member):
         print(f"⚠️ Couldn't close the verification card for {member}: {e}")
 
     member_inviters.pop(member.id, None)
+    inviter_text_cache.pop(member.id, None)
 
 
 async def find_latest_verification(channel: discord.TextChannel, member_id: int) -> discord.Message | None:
@@ -1613,38 +1630,79 @@ def _embed_text(embed: discord.Embed) -> str:
     return "\n".join(p for p in parts if p)
 
 
+def _parse_invite_post(guild: discord.Guild, member: discord.Member, msg: discord.Message) -> str | None:
+    """Reads ONE InviteLogger post. Returns the inviter text if the post is about `member`."""
+    texts = [msg.content or ""] + [_embed_text(e) for e in msg.embeds]
+    uid = str(member.id)
+    names = {n.lower() for n in (member.name, member.display_name, member.global_name) if n and len(n) >= 3}
+
+    for text in texts:
+        idx = text.lower().find("invited by")
+        if idx == -1:
+            continue
+        head = text[:idx]
+        # the post must be about THIS member (by ID first, then by name)
+        if uid not in head and not any(n in head.lower() for n in names):
+            continue
+        rest = text[idx + len("invited by"):].strip()
+        rest = re.split(r"\s+who\b|\n|[!]+\s*$", rest, maxsplit=1)[0].strip(" .!*`")
+        if not rest:
+            continue
+        mention = re.search(r"<@!?(\d+)>", rest)
+        if mention:
+            inviter_member = guild.get_member(int(mention.group(1)))
+            name = f" (`{inviter_member.name}`)" if inviter_member else ""
+            return f"<@{mention.group(1)}>{name}"
+        return f"**{rest}**"
+    return None
+
+
 async def lookup_inviter_from_log(guild: discord.Guild, member: discord.Member) -> str | None:
-    """Reads the InviteLogger posts in the -INVITE channel and returns who invited `member`
-    (newest matching post wins). Returns None if nothing is found."""
+    """Finds who invited `member`. Order: cache -> log posts around the join time -> wide scan."""
+    cached = inviter_text_cache.get(member.id)
+    if cached:
+        return cached
+
     channel = _find_invite_log_channel(guild)
     if channel is None:
         print("⚠️ Couldn't find the -INVITE log channel — set INVITE_LOG_CHANNEL_ID")
         return None
-    uid = str(member.id)
+
+    async def scan(**kwargs) -> str | None:
+        async for msg in channel.history(**kwargs):
+            found = _parse_invite_post(guild, member, msg)
+            if found:
+                return found
+        return None
+
     try:
-        async for msg in channel.history(limit=INVITE_LOG_SCAN_LIMIT):
-            if not msg.embeds:
-                continue
-            for embed in msg.embeds:
-                text = _embed_text(embed)
-                idx = text.lower().find("invited by")
-                if idx == -1 or uid not in text[:idx]:
-                    continue  # not this member's join post (or the id is only the inviter's)
-                rest = text[idx + len("invited by"):].strip()
-                rest = re.split(r"\s+who\b|\n|[!]+\s*$", rest, maxsplit=1)[0].strip(" .!*_`")
-                if not rest:
-                    continue
-                mention = re.search(r"<@!?(\d+)>", rest)
-                if mention:
-                    inviter_member = guild.get_member(int(mention.group(1)))
-                    name = f" (`{inviter_member.name}`)" if inviter_member else ""
-                    return f"<@{mention.group(1)}>{name}"
-                return f"**{rest}**"
+        result = None
+        if member.joined_at:
+            # Only look at the minutes around the join, so it works no matter how old the join is.
+            result = await scan(
+                after=member.joined_at - INVITE_LOG_WINDOW_BEFORE,
+                before=member.joined_at + INVITE_LOG_WINDOW_AFTER,
+                limit=200,
+                oldest_first=False,
+            )
+        if result is None:
+            result = await scan(limit=INVITE_LOG_WIDE_SCAN_LIMIT)   # safety net
+        if result:
+            inviter_text_cache[member.id] = result
+        return result
     except discord.Forbidden:
         print("⚠️ Can't read the -INVITE channel — give the bot View Channel + Read Message History there")
     except discord.HTTPException as e:
         print(f"⚠️ Couldn't read the -INVITE channel: {e}")
     return None
+
+
+async def prefetch_inviter(member: discord.Member):
+    """Right after a join, waits for InviteLogger to post, then remembers the inviter."""
+    for delay in (6, 15, 40):
+        await asyncio.sleep(delay)
+        if await lookup_inviter_from_log(member.guild, member):
+            return
 
 
 async def send_verification_alert(member: discord.Member, voice_channel: discord.VoiceChannel):
